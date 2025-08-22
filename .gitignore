@@ -1,0 +1,17 @@
+# Data files
+billing_data/
+*.xlsx
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Streamlit
+.streamlit/
