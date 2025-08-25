@@ -30,7 +30,7 @@ class FreightBillingChecker:
                 'carrier', 'client', 'tracking_number', 'service_type', 
                 'cost', 'billable_amount', 'weight', 'zone', 
                 'ship_date', 'delivery_date', 'invoice_status', 
-                'invoice_number', 'invoice_date', 'cycle_period', 
+                'invoice number', 'invoice date', 'cycle_period', 
                 'upload_timestamp', 'file_hash'
             ])
             shipment_df.to_excel(self.shipment_data_file, index=False)
@@ -40,7 +40,7 @@ class FreightBillingChecker:
             checklist_df = pd.DataFrame(columns=[
                 'client', 'carrier', 'cycle_period', 'shipment_count', 
                 'total_cost', 'total_billable', 'profit', 'profit_margin',
-                'invoice_status', 'invoice_number', 'invoice_date', 'notes'
+                'invoice_status', 'invoice number', 'invoice date', 'notes'
             ])
             checklist_df.to_excel(self.billing_checklist_file, index=False)
         
@@ -185,17 +185,46 @@ class FreightBillingChecker:
             if column_mapping:
                 df = df.rename(columns=column_mapping)
             
-            # Standard column names expected
+            # Standard column names expected - UPDATED WITH MORE VARIANTS
             standard_columns = {
-                'client': ['client', 'customer', 'customer_name', 'account', 'consignee', 'shipper'],
-                'tracking_number': ['tracking', 'tracking_number', 'tracking_id', 'awb', 'pro'],
-                'service_type': ['service', 'service_type', 'service_level'],
-                'cost': ['cost', 'freight_cost', 'shipping_cost', 'carrier_charge'],
-                'billable_amount': ['billable', 'billable_amount', 'revenue', 'charge_amount', 'bill_amount', 'invoice_amount'],
-                'weight': ['weight', 'package_weight', 'total_weight'],
-                'zone': ['zone', 'delivery_zone', 'shipping_zone'],
-                'ship_date': ['date', 'ship_date', 'pickup_date', 'service_date'],
-                'delivery_date': ['delivery_date', 'delivered_date', 'delivery']
+                'client': [
+                    'client', 'customer', 'customer_name', 'account', 'consignee', 
+                    'shipper', 'company', 'client_name', 'customer name', 'account name'
+                ],
+                'tracking_number': [
+                    'tracking', 'tracking_number', 'tracking_id', 'awb', 'pro', 
+                    'tracking number', 'tracking id', 'shipment id', 'reference'
+                ],
+                'service_type': [
+                    'service', 'service_type', 'service_level', 'service type',
+                    'service level', 'shipping service', 'delivery service'
+                ],
+                'cost': [
+                    'cost', 'freight_cost', 'shipping_cost', 'carrier_charge', 
+                    'total_cost', 'total cost', 'freight cost', 'shipping cost',
+                    'carrier cost', 'transport cost', 'delivery cost'
+                ],
+                'billable_amount': [
+                    'billable', 'billable_amount', 'revenue', 'charge_amount', 
+                    'bill_amount', 'invoice_amount', 'billable amount', 'bill amount',
+                    'invoice amount', 'charge amount', 'total billable', 'total_billable'
+                ],
+                'weight': [
+                    'weight', 'package_weight', 'total_weight', 'package weight',
+                    'total weight', 'shipment weight', 'gross weight'
+                ],
+                'zone': [
+                    'zone', 'delivery_zone', 'shipping_zone', 'delivery zone',
+                    'shipping zone', 'service zone'
+                ],
+                'ship_date': [
+                    'date', 'ship_date', 'pickup_date', 'service_date', 'ship date',
+                    'pickup date', 'service date', 'shipment date', 'send date'
+                ],
+                'delivery_date': [
+                    'delivery_date', 'delivered_date', 'delivery', 'delivery date',
+                    'delivered date', 'arrival date', 'completion date'
+                ]
             }
             
             # Auto-detect columns
@@ -285,7 +314,7 @@ class FreightBillingChecker:
         summary['profit'] = summary['total_billable'] - summary['total_cost']
         summary['profit_margin'] = (summary['profit'] / summary['total_billable'] * 100).round(2)
         summary['invoice_status'] = 'Ready to Bill'
-        summary['invoice_number'] = ''
+        summary['invoice number'] = ''
         summary['invoice_date'] = None
         summary['notes'] = ''
         
@@ -1101,14 +1130,14 @@ def show_settings(tracker):
         st.markdown("""
         **The system automatically detects these column variations:**
         
-        - **Client:** `client`, `customer`, `customer_name`, `account`, `consignee`, `shipper`
-        - **Cost:** `cost`, `freight_cost`, `shipping_cost`, `carrier_charge`
-        - **Billable Amount:** `billable`, `billable_amount`, `revenue`, `charge_amount`, `bill_amount`, `invoice_amount`
-        - **Tracking:** `tracking`, `tracking_number`, `tracking_id`, `awb`, `pro`
-        - **Service:** `service`, `service_type`, `service_level`
-        - **Weight:** `weight`, `package_weight`, `total_weight`
-        - **Zone:** `zone`, `delivery_zone`, `shipping_zone`
-        - **Dates:** `date`, `ship_date`, `pickup_date`, `service_date`, `delivery_date`
+        - **Client:** `client`, `customer`, `customer_name`, `account`, `consignee`, `shipper`, `company`, `client_name`, `customer name`, `account name`
+        - **Cost:** `cost`, `freight_cost`, `shipping_cost`, `carrier_charge`, `total_cost`, `total cost`, `freight cost`, `shipping cost`, `carrier cost`, `transport cost`, `delivery cost`
+        - **Billable Amount:** `billable`, `billable_amount`, `revenue`, `charge_amount`, `bill_amount`, `invoice_amount`, `billable amount`, `bill amount`, `invoice amount`, `charge amount`, `total billable`, `total_billable`
+        - **Tracking:** `tracking`, `tracking_number`, `tracking_id`, `awb`, `pro`, `tracking number`, `tracking id`, `shipment id`, `reference`
+        - **Service:** `service`, `service_type`, `service_level`, `service type`, `service level`, `shipping service`, `delivery service`
+        - **Weight:** `weight`, `package_weight`, `total_weight`, `package weight`, `total weight`, `shipment weight`, `gross weight`
+        - **Zone:** `zone`, `delivery_zone`, `shipping_zone`, `delivery zone`, `shipping zone`, `service zone`
+        - **Dates:** `date`, `ship_date`, `pickup_date`, `service_date`, `ship date`, `pickup date`, `service date`, `shipment date`, `send date`, `delivery_date`, `delivered_date`, `delivery`, `delivery date`, `delivered date`, `arrival date`, `completion date`
         """)
 
 if __name__ == "__main__":
