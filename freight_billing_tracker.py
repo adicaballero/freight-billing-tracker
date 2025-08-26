@@ -269,6 +269,39 @@ class FreightBillingChecker:
             
             # Load existing shipment data and append
             existing_shipments = self.load_shipment_data()
+            # Debug info
+            print(f"Existing data columns: {len(existing_shipments.columns) if not existing_shipments.empty else 0}")
+            print(f"New data columns: {len(df.columns)}")
+
+            if not existing_shipments.empty:
+                print("Existing columns:", list(existing_shipments.columns))
+                print("New columns:", list(df.columns))
+    
+                # Find column differences
+                existing_cols = set(existing_shipments.columns)
+                new_cols = set(df.columns)
+
+                missing_in_new = existing_cols - new_cols
+                missing_in_existing = new_cols - existing_cols
+    
+                if missing_in_new:
+                    print(f"Columns in existing but not new: {missing_in_new}")
+                if missing_in_existing:
+                    print(f"Columns in new but not existing: {missing_in_existing}")
+
+# Align columns before concatenation
+            if not existing_shipments.empty:
+                all_columns = list(set(existing_shipments.columns) | set(df.columns))
+    
+                for col in all_columns:
+                    if col not in existing_shipments.columns:
+                        existing_shipments[col] = None
+                    if col not in df.columns:
+                        df[col] = None
+    
+                existing_shipments = existing_shipments[all_columns]
+                df = df[all_columns]
+                
             combined_shipments = pd.concat([existing_shipments, df], ignore_index=True)
             self.save_shipment_data(combined_shipments)
             
