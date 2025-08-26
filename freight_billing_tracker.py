@@ -48,7 +48,7 @@ class FreightBillingChecker:
         if not self.upload_log_file.exists():
             log_df = pd.DataFrame(columns=[
                 'filename', 'file_hash', 'upload_date', 'records_imported',
-                'carrier', 'cycle_period'
+                'carrier', 'cycle_period','status', 'deleted_date'
             ])
             log_df.to_excel(self.upload_log_file, index=False)
     
@@ -493,7 +493,123 @@ class FreightBillingChecker:
                 totals.to_excel(writer, sheet_name='Summary_Totals', index=False)
         
         return output.getvalue()
+    # Add these methods to your FreightBillingChecker class:
 
+def delete_carrier_data(self, carrier_name, cycle_period):
+    """Delete all data for a specific carrier/cycle combination"""
+    try:
+        # Remove from shipment data
+        shipment_data = self.load_shipment_data()
+        if not shipment_data.empty:
+            updated_shipments = shipment_data[
+                ~((shipment_data['carrier'] == carrier_name) & 
+                  (shipment_data['cycle_period'] == cycle_period))
+            ]
+            self.save_shipment_data(updated_shipments)
+        
+        # Remove from billing checklist
+        checklist = self.load_billing_checklist()
+        if not checklist.empty:
+            updated_checklist = checklist[
+                ~((checklist['carrier'] == carrier_name) & 
+                  (checklist['cycle_period'] == cycle_period))
+            ]
+            self.save_billing_checklist(updated_checklist)
+        
+        # Update upload log (mark as deleted but keep for audit trail)
+        upload_log = self.load_upload_log()
+        if not upload_log.empty:
+            mask = ((upload_log['carrier'] == carrier_name) & 
+                   (upload_log['cycle_period'] == cycle_period))
+            upload_log.loc[mask, 'status'] = 'Deleted'
+            upload_log.loc[mask, 'deleted_date'] = datetime.now()
+            self.save_upload_log(upload_log)
+        
+        return True, f"Successfully deleted data for {carrier_name} - {cycle_period}"
+        
+    except Exception as e:
+        return False, f"Error deleting data: {str(e)}"
+
+def delete_client_cycle(self, client_name, cycle_period):
+    """Delete all data for a client in a specific cycle (all carriers)"""
+    try:
+        # Remove from shipment data
+        shipment_data = self.load_shipment_data()
+        if not shipment_data.empty:
+            updated_shipments = shipment_data[
+                ~((shipment_data['client'] == client_name) & 
+                  (shipment_data['cycle_period'] == cycle_period))
+            ]
+            self.save_shipment_data(updated_shipments)
+        
+        # Remove from billing checklist
+        checklist = self.load_billing_checklist()
+        if not checklist.empty:
+            updated_checklist = checklist[
+                ~((checklist['client'] == client_name) & 
+                  (checklist['cycle_period'] == cycle_period))
+            ]
+            self.save_billing_checklist(updated_checklist)
+        
+        return True, f"Successfully deleted all data for {client_name} - {cycle_period}"
+        
+    except Exception as e:
+        return False, f"Error deleting client data: {str(e)}"
+
+def get_data_summary(self):
+    """Get summary of all data for management view"""
+    shipment_data = self.load_shipment_data()
+    
+    if shipment_data.empty:
+        return pd.DataFrame()
+    
+    # Group by carrier, client, and cycle
+    summary = shipment_data.groupby(['carrier', 'client', 'cycle_period']).agg({
+        'tracking_number': 'count',
+        'cost': 'sum',
+        'billable_amount': 'sum',
+        'upload_timestamp': 'min'  # First upload timestamp
+    }).reset_index()
+    
+    summary.rename(columns={'tracking_number': 'shipment_count'}, inplace=True)
+    summary['profit'] = summary['billable_amount'] - summary['cost']
+    summary['upload_date'] = pd.to_datetime(summary['upload_timestamp']).dt.date
+    
+    return summary.sort_values(['cycle_period', 'client', 'carrier'], ascending=[False, True, True])
+
+def clear_all_data(self, confirmation_code):
+    """Clear all data with confirmation code"""
+    if confirmation_code != "DELETE_ALL_BILLING_DATA":
+        return False, "Invalid confirmation code"
+    
+    try:
+        # Clear all files by recreating them
+        self.init_excel_files()
+        return True, "All billing data has been cleared"
+    except Exception as e:
+        return False, f"Error clearing data: {str(e)}"
+
+def export_data_backup(self):
+    """Export complete backup of all data"""
+    try:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # All data
+            shipment_data = self.load_shipment_data()
+            billing_checklist = self.load_billing_checklist()
+            upload_log = self.load_upload_log()
+            
+            if not shipment_data.empty:
+                shipment_data.to_excel(writer, sheet_name='All_Shipments', index=False)
+            if not billing_checklist.empty:
+                billing_checklist.to_excel(writer, sheet_name='Billing_Checklist', index=False)
+            if not upload_log.empty:
+                upload_log.to_excel(writer, sheet_name='Upload_History', index=False)
+        
+        return output.getvalue()
+    except Exception as e:
+        return None
+    
 # Streamlit Web Interface
 def main():
     st.set_page_config(
@@ -527,7 +643,7 @@ def main():
     st.sidebar.title("Navigation")
     page = st.sidebar.selectbox(
         "Choose a page:",
-        ["📊 Billing Dashboard", "📤 Upload Carrier Data", "📋 Client Billing Checklist", "🚚 Carrier Breakdown", "📈 Reports", "⚙️ Settings"]
+        ["📊 Billing Dashboard", "📤 Upload Carrier Data", "📋 Client Billing Checklist", "🚚 Carrier Breakdown", "📈 Reports", "🗂️ Data Management","⚙️ Settings"]
     )
     
     if page == "📊 Billing Dashboard":
@@ -540,6 +656,8 @@ def main():
         show_carrier_breakdown(tracker)
     elif page == "📈 Reports":
         show_reports(tracker)
+    elif page == "🗂️ Data Management":
+        show_data_management(tracker)
     elif page == "⚙️ Settings":
         show_settings(tracker)
 
@@ -1139,6 +1257,251 @@ def show_settings(tracker):
         - **Zone:** `zone`, `delivery_zone`, `shipping_zone`, `delivery zone`, `shipping zone`, `service zone`
         - **Dates:** `date`, `ship_date`, `pickup_date`, `service_date`, `ship date`, `pickup date`, `service date`, `shipment date`, `send date`, `delivery_date`, `delivered_date`, `delivery`, `delivery date`, `delivered date`, `arrival date`, `completion date`
         """)
+
+def show_data_management(tracker):
+    """Show data management page for deleting/managing uploaded files"""
+    st.header("🗂️ Data Management")
+    st.markdown("*Manage uploaded carrier files and billing data*")
+    
+    # Get data summary
+    data_summary = tracker.get_data_summary()
+    
+    if data_summary.empty:
+        st.info("📋 No data to manage")
+        return
+    
+    # Tabs for different management options
+    tab1, tab2, tab3, tab4 = st.tabs(["🗑️ Delete Data", "📊 Data Overview", "💾 Backup", "⚠️ Reset All"])
+    
+    with tab1:
+        st.subheader("🗑️ Delete Uploaded Data")
+        st.warning("⚠️ **Warning:** Deleting data cannot be undone. Consider backing up first.")
+        
+        # Option 1: Delete by carrier/cycle
+        st.markdown("### Delete by Carrier & Cycle")
+        
+        with st.form("delete_carrier_cycle"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                carriers = list(data_summary['carrier'].unique())
+                delete_carrier = st.selectbox("🚚 Select Carrier", carriers)
+            
+            with col2:
+                if delete_carrier:
+                    cycles = data_summary[data_summary['carrier'] == delete_carrier]['cycle_period'].unique()
+                    delete_cycle = st.selectbox("📅 Select Cycle", cycles)
+                else:
+                    delete_cycle = None
+            
+            if delete_carrier and delete_cycle:
+                # Show what will be deleted
+                preview_data = data_summary[
+                    (data_summary['carrier'] == delete_carrier) & 
+                    (data_summary['cycle_period'] == delete_cycle)
+                ]
+                
+                if not preview_data.empty:
+                    st.markdown("**📋 Data to be deleted:**")
+                    display_preview = preview_data.copy()
+                    display_preview['cost'] = display_preview['cost'].apply(lambda x: f"${x:,.2f}")
+                    display_preview['billable_amount'] = display_preview['billable_amount'].apply(lambda x: f"${x:,.2f}")
+                    display_preview['profit'] = display_preview['profit'].apply(lambda x: f"${x:,.2f}")
+                    
+                    st.dataframe(display_preview[['client', 'shipment_count', 'cost', 'billable_amount', 'profit', 'upload_date']], 
+                               use_container_width=True, hide_index=True)
+                    
+                    # Confirmation
+                    confirm_delete = st.checkbox(f"✅ I confirm deletion of {delete_carrier} - {delete_cycle} data")
+                    
+                    if st.form_submit_button("🗑️ Delete Data", type="secondary"):
+                        if confirm_delete:
+                            success, message = tracker.delete_carrier_data(delete_carrier, delete_cycle)
+                            if success:
+                                st.success(f"✅ {message}")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {message}")
+                        else:
+                            st.error("❌ Please confirm deletion")
+        
+        # Option 2: Delete by client/cycle (all carriers)
+        st.markdown("---")
+        st.markdown("### Delete by Client & Cycle (All Carriers)")
+        
+        with st.form("delete_client_cycle"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                clients = list(data_summary['client'].unique())
+                delete_client = st.selectbox("👤 Select Client", clients)
+            
+            with col2:
+                if delete_client:
+                    cycles = data_summary[data_summary['client'] == delete_client]['cycle_period'].unique()
+                    delete_cycle_client = st.selectbox("📅 Select Cycle", cycles, key="client_cycle")
+                else:
+                    delete_cycle_client = None
+            
+            if delete_client and delete_cycle_client:
+                # Show what will be deleted
+                preview_data = data_summary[
+                    (data_summary['client'] == delete_client) & 
+                    (data_summary['cycle_period'] == delete_cycle_client)
+                ]
+                
+                if not preview_data.empty:
+                    st.markdown("**📋 Data to be deleted (all carriers):**")
+                    display_preview = preview_data.copy()
+                    display_preview['cost'] = display_preview['cost'].apply(lambda x: f"${x:,.2f}")
+                    display_preview['billable_amount'] = display_preview['billable_amount'].apply(lambda x: f"${x:,.2f}")
+                    display_preview['profit'] = display_preview['profit'].apply(lambda x: f"${x:,.2f}")
+                    
+                    st.dataframe(display_preview[['carrier', 'shipment_count', 'cost', 'billable_amount', 'profit', 'upload_date']], 
+                               use_container_width=True, hide_index=True)
+                    
+                    total_shipments = preview_data['shipment_count'].sum()
+                    total_billable = preview_data['billable_amount'].sum()
+                    st.info(f"📦 Total: {total_shipments:,} shipments, ${total_billable:,.2f} billable")
+                    
+                    # Confirmation
+                    confirm_delete_client = st.checkbox(f"✅ I confirm deletion of ALL {delete_client} data for {delete_cycle_client}")
+                    
+                    if st.form_submit_button("🗑️ Delete Client Data", type="secondary"):
+                        if confirm_delete_client:
+                            success, message = tracker.delete_client_cycle(delete_client, delete_cycle_client)
+                            if success:
+                                st.success(f"✅ {message}")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {message}")
+                        else:
+                            st.error("❌ Please confirm deletion")
+    
+    with tab2:
+        st.subheader("📊 Data Overview")
+        
+        # Summary stats
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            total_shipments = data_summary['shipment_count'].sum()
+            st.metric("📦 Total Shipments", f"{total_shipments:,}")
+        
+        with col2:
+            unique_clients = data_summary['client'].nunique()
+            st.metric("👥 Unique Clients", unique_clients)
+        
+        with col3:
+            unique_carriers = data_summary['carrier'].nunique()
+            st.metric("🚚 Carriers", unique_carriers)
+        
+        with col4:
+            unique_cycles = data_summary['cycle_period'].nunique()
+            st.metric("📅 Billing Cycles", unique_cycles)
+        
+        # Data table with formatted values
+        st.subheader("📋 All Uploaded Data")
+        display_summary = data_summary.copy()
+        display_summary['cost'] = display_summary['cost'].apply(lambda x: f"${x:,.2f}")
+        display_summary['billable_amount'] = display_summary['billable_amount'].apply(lambda x: f"${x:,.2f}")
+        display_summary['profit'] = display_summary['profit'].apply(lambda x: f"${x:,.2f}")
+        
+        st.dataframe(display_summary, use_container_width=True, hide_index=True)
+        
+        # Upload history
+        st.markdown("---")
+        st.subheader("📝 Upload History")
+        upload_log = tracker.load_upload_log()
+        
+        if not upload_log.empty:
+            # Add status column if it doesn't exist (for older versions)
+            if 'status' not in upload_log.columns:
+                upload_log['status'] = 'Active'
+            
+            # Format display
+            display_log = upload_log.copy()
+            display_log['upload_date'] = pd.to_datetime(display_log['upload_date']).dt.strftime('%Y-%m-%d %H:%M')
+            
+            st.dataframe(
+                display_log[['filename', 'carrier', 'cycle_period', 'records_imported', 'upload_date', 'status']], 
+                use_container_width=True, 
+                hide_index=True
+            )
+    
+    with tab3:
+        st.subheader("💾 Data Backup")
+        st.markdown("*Export complete backup of all billing data*")
+        
+        if st.button("📥 Generate Backup"):
+            backup_data = tracker.export_data_backup()
+            if backup_data:
+                filename = f"freight_billing_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                
+                st.download_button(
+                    "📁 Download Complete Backup",
+                    backup_data,
+                    filename,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                st.success("✅ Backup generated successfully!")
+            else:
+                st.error("❌ Error generating backup")
+        
+        # File sizes
+        st.markdown("---")
+        st.subheader("💾 Storage Information")
+        
+        files_info = []
+        files = [
+            ("Shipment Data", tracker.shipment_data_file),
+            ("Billing Checklist", tracker.billing_checklist_file),
+            ("Upload Log", tracker.upload_log_file)
+        ]
+        
+        for name, path in files:
+            if path.exists():
+                size_mb = path.stat().st_size / (1024 * 1024)
+                files_info.append([name, f"{size_mb:.2f} MB", "✅ Exists"])
+            else:
+                files_info.append([name, "0 MB", "❌ Missing"])
+        
+        files_df = pd.DataFrame(files_info, columns=["File", "Size", "Status"])
+        st.dataframe(files_df, use_container_width=True, hide_index=True)
+    
+    with tab4:
+        st.subheader("⚠️ Reset All Data")
+        st.error("🚨 **DANGER ZONE:** This will permanently delete ALL billing data")
+        
+        st.markdown("""
+        **This action will:**
+        - Delete all shipment records
+        - Clear the billing checklist
+        - Remove upload history
+        - Reset all files to empty state
+        
+        **⚠️ This cannot be undone!**
+        """)
+        
+        with st.form("reset_all_form"):
+            st.markdown("**To confirm, type:** `DELETE_ALL_BILLING_DATA`")
+            confirmation_code = st.text_input("Confirmation Code", type="password")
+            
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                if st.form_submit_button("🗑️ RESET ALL", type="secondary"):
+                    if confirmation_code == "DELETE_ALL_BILLING_DATA":
+                        success, message = tracker.clear_all_data(confirmation_code)
+                        if success:
+                            st.success("✅ All data has been cleared")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {message}")
+                    else:
+                        st.error("❌ Incorrect confirmation code")
+            
+            with col2:
+                st.info("💡 **Tip:** Generate a backup before resetting if you want to preserve data")
 
 if __name__ == "__main__":
     import time
