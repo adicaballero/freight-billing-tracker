@@ -495,121 +495,127 @@ class FreightBillingChecker:
         return output.getvalue()
     # Add these methods to your FreightBillingChecker class:
 
-def delete_carrier_data(self, carrier_name, cycle_period):
-    """Delete all data for a specific carrier/cycle combination"""
-    try:
-        # Remove from shipment data
-        shipment_data = self.load_shipment_data()
-        if not shipment_data.empty:
-            updated_shipments = shipment_data[
-                ~((shipment_data['carrier'] == carrier_name) & 
-                  (shipment_data['cycle_period'] == cycle_period))
-            ]
-            self.save_shipment_data(updated_shipments)
-        
-        # Remove from billing checklist
-        checklist = self.load_billing_checklist()
-        if not checklist.empty:
-            updated_checklist = checklist[
-                ~((checklist['carrier'] == carrier_name) & 
-                  (checklist['cycle_period'] == cycle_period))
-            ]
-            self.save_billing_checklist(updated_checklist)
-        
-        # Update upload log (mark as deleted but keep for audit trail)
-        upload_log = self.load_upload_log()
-        if not upload_log.empty:
-            mask = ((upload_log['carrier'] == carrier_name) & 
-                   (upload_log['cycle_period'] == cycle_period))
-            upload_log.loc[mask, 'status'] = 'Deleted'
-            upload_log.loc[mask, 'deleted_date'] = datetime.now()
-            self.save_upload_log(upload_log)
-        
-        return True, f"Successfully deleted data for {carrier_name} - {cycle_period}"
-        
-    except Exception as e:
-        return False, f"Error deleting data: {str(e)}"
-
-def delete_client_cycle(self, client_name, cycle_period):
-    """Delete all data for a client in a specific cycle (all carriers)"""
-    try:
-        # Remove from shipment data
-        shipment_data = self.load_shipment_data()
-        if not shipment_data.empty:
-            updated_shipments = shipment_data[
-                ~((shipment_data['client'] == client_name) & 
-                  (shipment_data['cycle_period'] == cycle_period))
-            ]
-            self.save_shipment_data(updated_shipments)
-        
-        # Remove from billing checklist
-        checklist = self.load_billing_checklist()
-        if not checklist.empty:
-            updated_checklist = checklist[
-                ~((checklist['client'] == client_name) & 
-                  (checklist['cycle_period'] == cycle_period))
-            ]
-            self.save_billing_checklist(updated_checklist)
-        
-        return True, f"Successfully deleted all data for {client_name} - {cycle_period}"
-        
-    except Exception as e:
-        return False, f"Error deleting client data: {str(e)}"
-
-def get_data_summary(self):
-    """Get summary of all data for management view"""
-    shipment_data = self.load_shipment_data()
-    
-    if shipment_data.empty:
-        return pd.DataFrame()
-    
-    # Group by carrier, client, and cycle
-    summary = shipment_data.groupby(['carrier', 'client', 'cycle_period']).agg({
-        'tracking_number': 'count',
-        'cost': 'sum',
-        'billable_amount': 'sum',
-        'upload_timestamp': 'min'  # First upload timestamp
-    }).reset_index()
-    
-    summary.rename(columns={'tracking_number': 'shipment_count'}, inplace=True)
-    summary['profit'] = summary['billable_amount'] - summary['cost']
-    summary['upload_date'] = pd.to_datetime(summary['upload_timestamp']).dt.date
-    
-    return summary.sort_values(['cycle_period', 'client', 'carrier'], ascending=[False, True, True])
-
-def clear_all_data(self, confirmation_code):
-    """Clear all data with confirmation code"""
-    if confirmation_code != "DELETE_ALL_BILLING_DATA":
-        return False, "Invalid confirmation code"
-    
-    try:
-        # Clear all files by recreating them
-        self.init_excel_files()
-        return True, "All billing data has been cleared"
-    except Exception as e:
-        return False, f"Error clearing data: {str(e)}"
-
-def export_data_backup(self):
-    """Export complete backup of all data"""
-    try:
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            # All data
+    def delete_carrier_data(self, carrier_name, cycle_period):
+        """Delete all data for a specific carrier/cycle combination"""
+        try:
+            # Remove from shipment data
             shipment_data = self.load_shipment_data()
-            billing_checklist = self.load_billing_checklist()
-            upload_log = self.load_upload_log()
-            
             if not shipment_data.empty:
-                shipment_data.to_excel(writer, sheet_name='All_Shipments', index=False)
-            if not billing_checklist.empty:
-                billing_checklist.to_excel(writer, sheet_name='Billing_Checklist', index=False)
+                updated_shipments = shipment_data[
+                    ~((shipment_data['carrier'] == carrier_name) & 
+                      (shipment_data['cycle_period'] == cycle_period))
+                ]
+                self.save_shipment_data(updated_shipments)
+            
+            # Remove from billing checklist
+            checklist = self.load_billing_checklist()
+            if not checklist.empty:
+                updated_checklist = checklist[
+                    ~((checklist['carrier'] == carrier_name) & 
+                      (checklist['cycle_period'] == cycle_period))
+                ]
+                self.save_billing_checklist(updated_checklist)
+            
+            # Update upload log (mark as deleted but keep for audit trail)
+            upload_log = self.load_upload_log()
             if not upload_log.empty:
-                upload_log.to_excel(writer, sheet_name='Upload_History', index=False)
+                mask = ((upload_log['carrier'] == carrier_name) & 
+                       (upload_log['cycle_period'] == cycle_period))
+                # Add status column if it doesn't exist
+                if 'status' not in upload_log.columns:
+                    upload_log['status'] = 'Active'
+                if 'deleted_date' not in upload_log.columns:
+                    upload_log['deleted_date'] = None
+                    
+                upload_log.loc[mask, 'status'] = 'Deleted'
+                upload_log.loc[mask, 'deleted_date'] = datetime.now()
+                self.save_upload_log(upload_log)
+            
+            return True, f"Successfully deleted data for {carrier_name} - {cycle_period}"
+            
+        except Exception as e:
+            return False, f"Error deleting data: {str(e)}"
+
+    def delete_client_cycle(self, client_name, cycle_period):
+        """Delete all data for a client in a specific cycle (all carriers)"""
+        try:
+            # Remove from shipment data
+            shipment_data = self.load_shipment_data()
+            if not shipment_data.empty:
+                updated_shipments = shipment_data[
+                    ~((shipment_data['client'] == client_name) & 
+                      (shipment_data['cycle_period'] == cycle_period))
+                ]
+                self.save_shipment_data(updated_shipments)
+            
+            # Remove from billing checklist
+            checklist = self.load_billing_checklist()
+            if not checklist.empty:
+                updated_checklist = checklist[
+                    ~((checklist['client'] == client_name) & 
+                      (checklist['cycle_period'] == cycle_period))
+                ]
+                self.save_billing_checklist(updated_checklist)
+            
+            return True, f"Successfully deleted all data for {client_name} - {cycle_period}"
+            
+        except Exception as e:
+            return False, f"Error deleting client data: {str(e)}"
+
+    def get_data_summary(self):
+        """Get summary of all data for management view"""
+        shipment_data = self.load_shipment_data()
         
-        return output.getvalue()
-    except Exception as e:
-        return None
-    
+        if shipment_data.empty:
+            return pd.DataFrame()
+        
+        # Group by carrier, client, and cycle
+        summary = shipment_data.groupby(['carrier', 'client', 'cycle_period']).agg({
+            'tracking_number': 'count',
+            'cost': 'sum',
+            'billable_amount': 'sum',
+            'upload_timestamp': 'min'  # First upload timestamp
+        }).reset_index()
+        
+        summary.rename(columns={'tracking_number': 'shipment_count'}, inplace=True)
+        summary['profit'] = summary['billable_amount'] - summary['cost']
+        summary['upload_date'] = pd.to_datetime(summary['upload_timestamp']).dt.date
+        
+        return summary.sort_values(['cycle_period', 'client', 'carrier'], ascending=[False, True, True])
+
+    def clear_all_data(self, confirmation_code):
+        """Clear all data with confirmation code"""
+        if confirmation_code != "DELETE_ALL_BILLING_DATA":
+            return False, "Invalid confirmation code"
+        
+        try:
+            # Clear all files by recreating them
+            self.init_excel_files()
+            return True, "All billing data has been cleared"
+        except Exception as e:
+            return False, f"Error clearing data: {str(e)}"
+
+    def export_data_backup(self):
+        """Export complete backup of all data"""
+        try:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                # All data
+                shipment_data = self.load_shipment_data()
+                billing_checklist = self.load_billing_checklist()
+                upload_log = self.load_upload_log()
+                
+                if not shipment_data.empty:
+                    shipment_data.to_excel(writer, sheet_name='All_Shipments', index=False)
+                if not billing_checklist.empty:
+                    billing_checklist.to_excel(writer, sheet_name='Billing_Checklist', index=False)
+                if not upload_log.empty:
+                    upload_log.to_excel(writer, sheet_name='Upload_History', index=False)
+            
+            return output.getvalue()
+        except Exception as e:
+            return None
+
 # Streamlit Web Interface
 def main():
     st.set_page_config(
