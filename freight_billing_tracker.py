@@ -126,66 +126,69 @@ class FreightBillingChecker:
     
     def process_carrier_file(self, file, carrier_name, cycle_period, column_mapping=None, replace_existing=False):
         """
-        Process uploaded carrier reconciliation file with large file support and replacement option
-        
-        Parameters:
-        file: Uploaded file object
-        carrier_name: Name of the carrier
-        cycle_period: Billing cycle (e.g., '2024-08', 'Week 32-2024')
-        column_mapping: Dictionary mapping file columns to standard columns
-        replace_existing: If True, replace existing data for this carrier/cycle
+        Process uploaded carrier reconciliation file with improved column handling
         """
         try:
             # Check for existing data
             has_existing, existing_count = self.check_existing_data(carrier_name, cycle_period)
-            
+        
             if has_existing and not replace_existing:
                 return False, f"Data already exists for {carrier_name} - {cycle_period} ({existing_count:,} records). Use 'Replace Existing Data' option to update."
-            
+        
             # Check file size
             file_size_mb = len(file.getvalue()) / (1024 * 1024)
-            
+        
             # Remove existing data if replacing
             if replace_existing and has_existing:
                 self.remove_existing_data(carrier_name, cycle_period)
-            
-            # Read file with progress indication for large files
-            if file.name.endswith('.xlsx'):
-                if file_size_mb > 10:
-                    # Use read_excel with engine optimization for large files
-                    df = pd.read_excel(file, engine='openpyxl')
+        
+            # Read file with better error handling
+            try:
+                if file.name.endswith('.xlsx'):
+                    if file_size_mb > 10:
+                        df = pd.read_excel(file, engine='openpyxl')
+                    else:
+                        df = pd.read_excel(file)
+                elif file.name.endswith('.csv'):
+                    if file_size_mb > 10:
+                        chunk_list = []
+                        chunk_size = 10000
+                        for chunk in pd.read_csv(file, chunksize=chunk_size):
+                            chunk_list.append(chunk)
+                        df = pd.concat(chunk_list, ignore_index=True)
+                    else:
+                        df = pd.read_csv(file)
                 else:
-                    df = pd.read_excel(file)
-            elif file.name.endswith('.csv'):
-                if file_size_mb > 10:
-                    # Read CSV in chunks for very large files
-                    chunk_list = []
-                    chunk_size = 10000
-                    for chunk in pd.read_csv(file, chunksize=chunk_size):
-                        chunk_list.append(chunk)
-                    df = pd.concat(chunk_list, ignore_index=True)
-                else:
-                    df = pd.read_csv(file)
-            else:
-                return False, "Unsupported file format. Please use Excel or CSV."
-            
-            # Show file processing info
-            processing_info = f"Processing {len(df):,} records ({file_size_mb:.1f} MB)"
-            
-            # Generate file hash
-            file_content = file.getvalue()
-            file_hash = self.get_file_hash(file_content)
-            
-            # Check if file already uploaded (skip check if replacing)
-            upload_log = self.load_upload_log()
-            if not replace_existing and not upload_log.empty and file_hash in upload_log['file_hash'].values:
-                return False, "This exact file has already been uploaded."
-            
-            # Standardize columns
+                    return False, "Unsupported file format. Please use Excel or CSV."
+            except Exception as e:
+                return False, f"Error reading file: {str(e)}"
+       
+            # Debug: Check initial DataFrame shape
+            initial_shape = df.shape
+            print(f"Initial file shape: {initial_shape}")
+        
+            # Remove completely empty columns (common cause of excessive column count)
+            df = df.dropna(axis=1, how='all')
+        
+            # Remove columns that are mostly empty (>95% null)
+            null_threshold = 0.95
+            null_percentages = df.isnull().mean()
+            cols_to_keep = null_percentages[null_percentages < null_threshold].index
+            df = df[cols_to_keep]
+        
+            print(f"After cleaning empty columns: {df.shape}")
+        
+            # Limit to reasonable number of columns (safety check)
+            if df.shape[1] > 100:
+                # Keep only first 100 columns to prevent memory issues
+                df = df.iloc[:, :100]
+                print(f"Limited to first 100 columns: {df.shape}")
+        
+            # Standardize columns with manual mapping if provided
             if column_mapping:
                 df = df.rename(columns=column_mapping)
-            
-            # Standard column names expected - UPDATED WITH MORE VARIANTS
+        
+            # Auto-detect columns (your existing logic but more robust)
             standard_columns = {
                 'client': [
                     'client', 'customer', 'customer_name', 'account', 'consignee', 
@@ -207,7 +210,7 @@ class FreightBillingChecker:
                 'billable_amount': [
                     'billable', 'billable_amount', 'revenue', 'charge_amount', 
                     'bill_amount', 'invoice_amount', 'billable amount', 'bill amount',
-                    'invoice amount', 'charge amount', 'total billable', 'total_billable'
+                '   invoice amount', 'charge amount', 'total billable', 'total_billable'
                 ],
                 'weight': [
                     'weight', 'package_weight', 'total_weight', 'package weight',
@@ -226,89 +229,108 @@ class FreightBillingChecker:
                     'delivered date', 'arrival date', 'completion date'
                 ]
             }
-            
-            # Auto-detect columns
+
+            # Auto-detect columns with better matching
             column_map = {}
+            df_columns_lower = {col: col.lower().strip().replace(' ', '').replace('_', '') for col in df.columns}
+        
             for standard, variants in standard_columns.items():
-                for col in df.columns:
-                    # Clean column name for comparison (remove spaces, underscores, convert to lowercase)
-                    clean_col = col.lower().replace(' ', '').replace('_', '')
-                    # Clean variant names the same way
+                found = False
+                for original_col, clean_col in df_columns_lower.items():
                     clean_variants = [v.lower().replace(' ', '').replace('_', '') for v in variants]
                     if clean_col in clean_variants:
-                        column_map[col] = standard
+                        column_map[original_col] = standard
+                        found = True
                         break
             
+                # If not found and it's a required column, try partial matching
+                if not found and standard in ['client', 'cost', 'billable_amount']:
+                    for original_col, clean_col in df_columns_lower.items():
+                        if standard == 'client' and any(word in clean_col for word in ['client', 'customer', 'account']):
+                            column_map[original_col] = standard
+                            break
+                        elif standard == 'cost' and any(word in clean_col for word in ['cost', 'charge', 'freight']):
+                            column_map[original_col] = standard
+                            break
+                        elif standard == 'billable_amount' and any(word in clean_col for word in ['billable', 'revenue', 'bill']):
+                            column_map[original_col] = standard
+                            break
+
+            # Apply column mapping
             df = df.rename(columns=column_map)
-            
+        
             # Ensure required columns exist
             required_cols = ['client', 'cost', 'billable_amount']
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
-                return False, f"Missing required columns: {missing_cols}. File must contain client, cost, and billable amount data."
-            
-            # Clean and process data
+                available_cols = list(df.columns)
+                return False, f"Missing required columns: {missing_cols}. Available columns: {available_cols[:20]}..."
+        
+            # Keep only the columns we need/recognize - THIS IS KEY
+            standard_column_names = list(standard_columns.keys()) + [
+                'carrier', 'cycle_period', 'file_hash', 'upload_timestamp', 
+                'invoice_status', 'invoice_number', 'invoice_date'
+            ]
+        
+            # Select only standard columns that exist in the DataFrame
+            cols_to_keep = [col for col in standard_column_names if col in df.columns]
+            df = df[cols_to_keep]
+        
+            print(f"After column selection: {df.shape}")
+        
+            # Add required metadata columns
             df['carrier'] = carrier_name
             df['cycle_period'] = cycle_period
-            df['file_hash'] = file_hash
+            df['file_hash'] = self.get_file_hash(file.getvalue())
             df['upload_timestamp'] = datetime.now()
             df['invoice_status'] = 'Ready to Bill'
-            
+        
+            # Add missing standard columns with default values
+            if 'invoice_number' not in df.columns:
+                df['invoice_number'] = ''
+            if 'invoice_date' not in df.columns:
+                df['invoice_date'] = None
+        
             # Convert numeric columns
             for col in ['cost', 'billable_amount', 'weight']:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
-            
+        
             # Remove rows with missing critical data
             initial_count = len(df)
             df = df.dropna(subset=['cost', 'billable_amount'])
             final_count = len(df)
-            
+        
             if final_count == 0:
                 return False, "No valid records found with both cost and billable amount data."
-            
-            # Load existing shipment data and append
+        
+            # Now concatenate with existing data
             existing_shipments = self.load_shipment_data()
-            # Debug info
-            print(f"Existing data columns: {len(existing_shipments.columns) if not existing_shipments.empty else 0}")
-            print(f"New data columns: {len(df.columns)}")
-
+        
             if not existing_shipments.empty:
-                print("Existing columns:", list(existing_shipments.columns))
-                print("New columns:", list(df.columns))
-    
-                # Find column differences
-                existing_cols = set(existing_shipments.columns)
-                new_cols = set(df.columns)
-
-                missing_in_new = existing_cols - new_cols
-                missing_in_existing = new_cols - existing_cols
-    
-                if missing_in_new:
-                    print(f"Columns in existing but not new: {missing_in_new}")
-                if missing_in_existing:
-                    print(f"Columns in new but not existing: {missing_in_existing}")
-
-            # Align columns before concatenation
-            if not existing_shipments.empty:
-                all_columns = list(set(existing_shipments.columns) | set(df.columns))
-    
-                for col in all_columns:
+                # Ensure both DataFrames have the same columns in the same order
+                final_columns = list(df.columns)
+            
+                # Add any missing columns to existing data
+                for col in final_columns:
                     if col not in existing_shipments.columns:
-                        existing_shipments[col] = None
-                    if col not in df.columns:
-                        df[col] = None
-    
-                existing_shipments = existing_shipments[all_columns]
-                df = df[all_columns]
-
+                        existing_shipments[col] = None if col != 'invoice_date' else pd.NaT
+            
+                # Reorder existing data to match new data column order
+                existing_shipments = existing_shipments[final_columns]
+        
+            print(f"Final existing shape: {existing_shipments.shape if not existing_shipments.empty else (0,0)}")
+            print(f"Final new shape: {df.shape}")
+        
+            # Safe concatenation
             combined_shipments = pd.concat([existing_shipments, df], ignore_index=True)
             self.save_shipment_data(combined_shipments)
-            
+        
+            # Rest of your existing code...
             # Update upload log
             new_log_entry = pd.DataFrame([{
                 'filename': file.name,
-                'file_hash': file_hash,
+                'file_hash': self.get_file_hash(file.getvalue()),
                 'upload_date': datetime.now(),
                 'records_imported': final_count,
                 'carrier': carrier_name,
@@ -317,18 +339,18 @@ class FreightBillingChecker:
             existing_log = self.load_upload_log()
             combined_log = pd.concat([existing_log, new_log_entry], ignore_index=True)
             self.save_upload_log(combined_log)
-            
+        
             # Update billing checklist
             self.update_billing_checklist(df)
-            
+        
             message = f"Successfully {'replaced' if replace_existing and has_existing else 'imported'} {final_count:,} shipments for {carrier_name} ({file_size_mb:.1f} MB)"
             if replace_existing and has_existing:
                 message += f" (replaced {existing_count:,} existing records)"
             if initial_count != final_count:
                 message += f" (removed {initial_count - final_count:,} records with missing data)"
-            
+        
             return True, message
-            
+        
         except Exception as e:
             return False, f"Error processing file: {str(e)}"
     
