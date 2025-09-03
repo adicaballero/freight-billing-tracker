@@ -141,34 +141,27 @@ class FreightBillingChecker:
             # Remove existing data if replacing
             if replace_existing and has_existing:
                 self.remove_existing_data(carrier_name, cycle_period)
-        
+
             # Read file with better error handling
-            try:
-                if file.name.endswith('.xlsx'):
-                    if file_size_mb > 10:
-                        df = pd.read_excel(file, engine='openpyxl')
-                    else:
-                        df = pd.read_excel(file)
-                elif file.name.endswith('.csv'):
-                    if file_size_mb > 10:
-                        chunk_list = []
-                        chunk_size = 10000
-                        for chunk in pd.read_csv(file, chunksize=chunk_size):
-                            chunk_list.append(chunk)
-                        df = pd.concat(chunk_list, ignore_index=True)
-                    else:
-                        df = pd.read_csv(file)
+            if file.name.endswith('.xlsx'):
+                df = pd.read_excel(file, engine='openpyxl')
+            elif file.name.endswith('.csv'):
+                if file_size_mb > 10:
+                    chunk_list = []
+                    chunk_size = 10000
+                    for chunk in pd.read_csv(file, chunksize=chunk_size):
+                        chunk_list.append(chunk)
+                    df = pd.concat(chunk_list, ignore_index=True)
                 else:
-                    return False, "Unsupported file format. Please use Excel or CSV."
-            except Exception as e:
-                return False, f"Error reading file: {str(e)}"
-       
-            # Debug: Check initial DataFrame shape
-            initial_shape = df.shape
-            print(f"Initial file shape: {initial_shape}")
-        
-            # Remove completely empty columns (common cause of excessive column count)
-            df = df.dropna(axis=1, how='all')
+                    df = pd.read_csv(file)
+            else:
+                return False, "Unsupported file format. Please use Excel or CSV."
+
+            print(f"Raw file shape: {df.shape}")
+
+            # Clean up DataFrame - remove empty columns and rows
+            df = df.dropna(axis=1, how='all')  # Remove completely empty columns
+            df = df.dropna(axis=0, how='all')  # Remove completely empty rows
         
             # Remove columns that are mostly empty (>95% null)
             null_threshold = 0.95
@@ -176,13 +169,7 @@ class FreightBillingChecker:
             cols_to_keep = null_percentages[null_percentages < null_threshold].index
             df = df[cols_to_keep]
         
-            print(f"After cleaning empty columns: {df.shape}")
-        
-            # Limit to reasonable number of columns (safety check)
-            if df.shape[1] > 100:
-                # Keep only first 100 columns to prevent memory issues
-                df = df.iloc[:, :100]
-                print(f"Limited to first 100 columns: {df.shape}")
+            print(f"After cleaning: {df.shape}")
         
             # Standardize columns with manual mapping if provided
             if column_mapping:
@@ -235,113 +222,133 @@ class FreightBillingChecker:
             df_columns_lower = {col: col.lower().strip().replace(' ', '').replace('_', '') for col in df.columns}
         
             for standard, variants in standard_columns.items():
-                found = False
                 for original_col, clean_col in df_columns_lower.items():
                     clean_variants = [v.lower().replace(' ', '').replace('_', '') for v in variants]
                     if clean_col in clean_variants:
                         column_map[original_col] = standard
-                        found = True
                         break
-            
-                # If not found and it's a required column, try partial matching
-                if not found and standard in ['client', 'cost', 'billable_amount']:
-                    for original_col, clean_col in df_columns_lower.items():
-                        if standard == 'client' and any(word in clean_col for word in ['client', 'customer', 'account']):
-                            column_map[original_col] = standard
-                            break
-                        elif standard == 'cost' and any(word in clean_col for word in ['cost', 'charge', 'freight']):
-                            column_map[original_col] = standard
-                            break
-                        elif standard == 'billable_amount' and any(word in clean_col for word in ['billable', 'revenue', 'bill']):
-                            column_map[original_col] = standard
-                            break
 
             # Apply column mapping
             df = df.rename(columns=column_map)
-        
-            # Ensure required columns exist
+
+            print(f'"Columns after auto-detection: {list(df.columns)}")')
+
+            # Verify required columns exist
             required_cols = ['client', 'cost', 'billable_amount']
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 available_cols = list(df.columns)
-                return False, f"Missing required columns: {missing_cols}. Available columns: {available_cols[:20]}..."
-        
-            # Keep only the columns we need/recognize - THIS IS KEY
-            standard_column_names = list(standard_columns.keys()) + [
-                'carrier', 'cycle_period', 'file_hash', 'upload_timestamp', 
-                'invoice_status', 'invoice_number', 'invoice_date'
+                return False, f"Missing required columns: {missing_cols}. Available columns: {available_cols}"
+
+            # CREATE STANDARDIZED DATAFRAME
+            # Define our exact standard structure (16 columns)
+            STANDARD_COLUMNS = [
+                'carrier', 'client', 'tracking_number', 'service_type', 
+                'cost', 'billable_amount', 'weight', 'zone', 
+                'ship_date', 'delivery_date', 'invoice_status', 
+                'invoice_number', 'invoice_date', 'cycle_period', 
+                'upload_timestamp', 'file_hash'
             ]
         
-            # Select only standard columns that exist in the DataFrame
-            cols_to_keep = [col for col in standard_column_names if col in df.columns]
-            df = df[cols_to_keep]
-        
-            print(f"After column selection: {df.shape}")
-        
-            # Add required metadata columns
-            df['carrier'] = carrier_name
-            df['cycle_period'] = cycle_period
-            df['file_hash'] = self.get_file_hash(file.getvalue())
-            df['upload_timestamp'] = datetime.now()
-            df['invoice_status'] = 'Ready to Bill'
-        
-            # Add missing standard columns with default values
-            if 'invoice_number' not in df.columns:
-                df['invoice_number'] = ''
-            if 'invoice_date' not in df.columns:
-                df['invoice_date'] = None
-        
-            # Convert numeric columns
-            for col in ['cost', 'billable_amount', 'weight']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            # Build standardized DataFrame
+            standardized_data = []
+
+            for index, row in df.iterrows():
+                standard_row = {
+                    'carrier': carrier_name,
+                    'client': str(row.get('client', '')).strip(),
+                    'tracking_number': str(row.get('tracking_number', '')).strip(),
+                    'service_type': str(row.get('service_type', '')).strip(),
+                    'cost': pd.to_numeric(row.get('cost', 0), errors='coerce'),
+                    'billable_amount': pd.to_numeric(row.get('billable_amount', 0), errors='coerce'),
+                    'weight': pd.to_numeric(row.get('weight'), errors='coerce'),
+                    'zone': str(row.get('zone', '')).strip(),
+                    'ship_date': pd.to_datetime(row.get('ship_date'), errors='coerce'),
+                    'delivery_date': pd.to_datetime(row.get('delivery_date'), errors='coerce'),
+                    'invoice_status': 'Ready to Bill',
+                    'invoice_number': '',
+                    'invoice_date': pd.to_datetime(row.get('invoice_date'), errors='coerce'),
+                    'cycle_period': cycle_period,
+                    'upload_timestamp': datetime.now(),
+                    'file_hash': self.get_file_hash(file.getvalue())
+                }
+                standardized_data.append(standard_row)
+
+            # Create standardized DataFrame with exact column structure
+            standardized_df = pd.DataFrame(standardized_data, columns=STANDARD_COLUMNS)
         
             # Remove rows with missing critical data
-            initial_count = len(df)
-            df = df.dropna(subset=['cost', 'billable_amount'])
-            final_count = len(df)
-        
+            initial_count = len(standardized_df)
+            standardized_df = standardized_df.dropna(subset=['cost', 'billable_amount'])
+            standardized_df = standardized_df[
+                (standardized_df['cost'] != 0) | (standardized_df['billable_amount'] != 0)
+            ]
+            final_count = len(standardized_df)
+
             if final_count == 0:
-                return False, "No valid records found with both cost and billable amount data."
-        
-            # Now concatenate with existing data
+                return False, "No valid records found with both costs and billable amount data."
+
+            print(f"Standardised DataFrame: {standardized_df.shape}")
+
+            # Handle existing data with structure enforcement
             existing_shipments = self.load_shipment_data()
         
             if not existing_shipments.empty:
-                # Ensure both DataFrames have the same columns in the same order
-                final_columns = list(df.columns)
+                print(f"Existing data before standardization: {existing_shipments.shape}")
             
-                # Add any missing columns to existing data
-                for col in final_columns:
-                    if col not in existing_shipments.columns:
-                        existing_shipments[col] = None if col != 'invoice_date' else pd.NaT
+                # Force existing data into standard structure
+                existing_standardized = pd.DataFrame(columns=STANDARD_COLUMNS)
             
-                # Reorder existing data to match new data column order
-                existing_shipments = existing_shipments[final_columns]
+            for col in STANDARD_COLUMNS:
+                if col in existing_shipments.columns:
+                    existing_standardized[col] = existing_shipments[col]
+                else:
+                    # Add missing columns with appropriate defaults
+                    if col in ['ship_date', 'delivery_date', 'invoice_date']:
+                        existing_standardized[col] = pd.NaT
+                    elif col in ['cost', 'billable_amount', 'weight']:
+                        existing_standardized[col] = 0
+                    else:
+                        existing_standardized[col] = ''
+            
+                print(f"Existing data after standardization: {existing_standardized.shape}")
+            
+                # Safe concatenation with identical structures
+                combined_shipments = pd.concat([existing_standardized, standardized_df], ignore_index=True)
+            else:
+                combined_shipments = standardized_df
         
-            print(f"Final existing shape: {existing_shipments.shape if not existing_shipments.empty else (0,0)}")
-            print(f"Final new shape: {df.shape}")
+            print(f"Final combined shape: {combined_shipments.shape}")
         
-            # Safe concatenation
-            combined_shipments = pd.concat([existing_shipments, df], ignore_index=True)
+            # Save the data
             self.save_shipment_data(combined_shipments)
         
-            # Rest of your existing code...
             # Update upload log
+            upload_log = self.load_upload_log()
+        
             new_log_entry = pd.DataFrame([{
                 'filename': file.name,
                 'file_hash': self.get_file_hash(file.getvalue()),
                 'upload_date': datetime.now(),
                 'records_imported': final_count,
                 'carrier': carrier_name,
-                'cycle_period': cycle_period
+                'cycle_period': cycle_period,
+                'status': 'Active',
+                'deleted_date': None
             }])
-            existing_log = self.load_upload_log()
-            combined_log = pd.concat([existing_log, new_log_entry], ignore_index=True)
+        
+            # Ensure upload log structure consistency
+            if not upload_log.empty:
+                if 'status' not in upload_log.columns:
+                    upload_log['status'] = 'Active'
+                if 'deleted_date' not in upload_log.columns:
+                    upload_log['deleted_date'] = None
+        
+            combined_log = pd.concat([upload_log, new_log_entry], ignore_index=True)
             self.save_upload_log(combined_log)
         
             # Update billing checklist
-            self.update_billing_checklist(df)
+            self.update_billing_checklist(standardized_df)
         
             message = f"Successfully {'replaced' if replace_existing and has_existing else 'imported'} {final_count:,} shipments for {carrier_name} ({file_size_mb:.1f} MB)"
             if replace_existing and has_existing:
@@ -352,8 +359,10 @@ class FreightBillingChecker:
             return True, message
         
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return False, f"Error processing file: {str(e)}"
-    
+        
     def update_billing_checklist(self, new_shipments):
         """Update billing checklist with new shipment data"""
         # Group by client, carrier, and cycle period
