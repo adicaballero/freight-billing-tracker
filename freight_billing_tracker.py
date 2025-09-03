@@ -289,7 +289,7 @@ class FreightBillingChecker:
                 if missing_in_existing:
                     print(f"Columns in new but not existing: {missing_in_existing}")
 
-# Align columns before concatenation
+            # Align columns before concatenation
             if not existing_shipments.empty:
                 all_columns = list(set(existing_shipments.columns) | set(df.columns))
     
@@ -301,7 +301,7 @@ class FreightBillingChecker:
     
                 existing_shipments = existing_shipments[all_columns]
                 df = df[all_columns]
-                
+
             combined_shipments = pd.concat([existing_shipments, df], ignore_index=True)
             self.save_shipment_data(combined_shipments)
             
