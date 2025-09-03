@@ -299,18 +299,18 @@ class FreightBillingChecker:
                 # Force existing data into standard structure
                 existing_standardized = pd.DataFrame(columns=STANDARD_COLUMNS)
             
-            for col in STANDARD_COLUMNS:
-                if col in existing_shipments.columns:
-                    existing_standardized[col] = existing_shipments[col]
-                else:
-                    # Add missing columns with appropriate defaults
-                    if col in ['ship_date', 'delivery_date', 'invoice_date']:
-                        existing_standardized[col] = pd.NaT
-                    elif col in ['cost', 'billable_amount', 'weight']:
-                        existing_standardized[col] = 0
+                for col in STANDARD_COLUMNS:
+                    if col in existing_shipments.columns:
+                        existing_standardized[col] = existing_shipments[col]
                     else:
-                        existing_standardized[col] = ''
-            
+                        # Add missing columns with appropriate defaults
+                        if col in ['ship_date', 'delivery_date', 'invoice_date']:
+                            existing_standardized[col] = pd.NaT
+                        elif col in ['cost', 'billable_amount', 'weight']:
+                            existing_standardized[col] = 0
+                        else:
+                            existing_standardized[col] = ''
+
                 print(f"Existing data after standardization: {existing_standardized.shape}")
             
                 # Safe concatenation with identical structures
