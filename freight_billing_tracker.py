@@ -5,6 +5,8 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import io
 import os
+import json
+import re
 from pathlib import Path
 import hashlib
 
@@ -18,8 +20,10 @@ class FreightBillingChecker:
         self.shipment_data_file = self.data_folder / "shipment_data.xlsx"
         self.billing_checklist_file = self.data_folder / "billing_checklist.xlsx"
         self.upload_log_file = self.data_folder / "upload_log.xlsx"
+        self.config_file = self.data_folder / "config.json"
         
         self.init_excel_files()
+        self.load_config()
     
     def init_excel_files(self):
         """Create Excel files if they don't exist"""
@@ -48,9 +52,430 @@ class FreightBillingChecker:
         if not self.upload_log_file.exists():
             log_df = pd.DataFrame(columns=[
                 'filename', 'file_hash', 'upload_date', 'records_imported',
-                'carrier', 'cycle_period','status', 'deleted_date'
+                'carrier', 'cycle_period','status', 'deleted_date', 'source_path'
             ])
             log_df.to_excel(self.upload_log_file, index=False)
+    
+    def load_config(self):
+        """Load configuration from JSON file"""
+        default_config = {
+            'input_folder': '',
+            'filename_pattern': 'auto',  # auto, manual
+            'processed_files': []  # List of processed file paths
+        }
+        
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, 'r') as f:
+                    self.config = json.load(f)
+                # Ensure all keys exist
+                for key, value in default_config.items():
+                    if key not in self.config:
+                        self.config[key] = value
+            except:
+                self.config = default_config
+        else:
+            self.config = default_config
+    
+    def save_config(self):
+        """Save configuration to JSON file"""
+        with open(self.config_file, 'w') as f:
+            json.dump(self.config, f, indent=2)
+    
+    def set_input_folder(self, folder_path):
+        """Set the input folder path"""
+        self.config['input_folder'] = folder_path
+        self.save_config()
+    
+    def get_input_folder(self):
+        """Get the configured input folder path"""
+        return self.config.get('input_folder', '')
+    
+    def parse_filename(self, filename):
+        """
+        Parse carrier name and cycle period from filename.
+        Supports multiple formats:
+        - CarrierName_YYYY-MM.xlsx (e.g., FedEx_2024-08.xlsx)
+        - CarrierName_MonthYYYY.xlsx (e.g., UPS_November2024.xlsx)
+        - CarrierName_YYYY-MM-WeekN.xlsx (e.g., DHL_2024-08-Week1.xlsx)
+        - CarrierName_CyclePeriod.xlsx (generic)
+        
+        Returns: (carrier_name, cycle_period) or (None, None) if parsing fails
+        """
+        # Remove extension
+        name_without_ext = Path(filename).stem
+        
+        # Try to split by underscore
+        parts = name_without_ext.split('_', 1)
+        
+        if len(parts) == 2:
+            carrier_name = parts[0].strip()
+            cycle_part = parts[1].strip()
+            
+            # Clean up carrier name (replace common separators)
+            carrier_name = carrier_name.replace('-', ' ').replace('_', ' ').title()
+            
+            # Try to normalize cycle period
+            cycle_period = self.normalize_cycle_period(cycle_part)
+            
+            return carrier_name, cycle_period
+        
+        # Try splitting by hyphen if underscore didn't work
+        parts = name_without_ext.split('-', 1)
+        if len(parts) == 2:
+            carrier_name = parts[0].strip().title()
+            cycle_period = self.normalize_cycle_period(parts[1].strip())
+            return carrier_name, cycle_period
+        
+        return None, None
+    
+    def normalize_cycle_period(self, cycle_str):
+        """
+        Normalize cycle period string to consistent format.
+        Tries to convert various formats to YYYY-MM or keeps as-is.
+        """
+        cycle_str = cycle_str.strip()
+        
+        # Already in YYYY-MM format
+        if re.match(r'^\d{4}-\d{2}$', cycle_str):
+            return cycle_str
+        
+        # YYYY-MM-WeekN format - keep as is
+        if re.match(r'^\d{4}-\d{2}-Week\d+$', cycle_str, re.IGNORECASE):
+            return cycle_str
+        
+        # MonthYYYY format (e.g., November2024)
+        month_match = re.match(r'^([A-Za-z]+)(\d{4})$', cycle_str)
+        if month_match:
+            month_name = month_match.group(1)
+            year = month_match.group(2)
+            try:
+                month_num = datetime.strptime(month_name, '%B').month
+                return f"{year}-{month_num:02d}"
+            except:
+                pass
+        
+        # MonthYY format (e.g., Nov24)
+        month_match = re.match(r'^([A-Za-z]{3})(\d{2})$', cycle_str)
+        if month_match:
+            month_name = month_match.group(1)
+            year = month_match.group(2)
+            try:
+                month_num = datetime.strptime(month_name, '%b').month
+                return f"20{year}-{month_num:02d}"
+            except:
+                pass
+        
+        # Return as-is if no pattern matches
+        return cycle_str
+    
+    def scan_input_folder(self):
+        """
+        Scan the configured input folder for carrier files.
+        Returns list of file info dicts with parsing results.
+        """
+        input_folder = self.get_input_folder()
+        
+        if not input_folder:
+            return [], "No input folder configured"
+        
+        folder_path = Path(input_folder)
+        
+        if not folder_path.exists():
+            return [], f"Folder does not exist: {input_folder}"
+        
+        if not folder_path.is_dir():
+            return [], f"Path is not a folder: {input_folder}"
+        
+        # Get list of processed files
+        processed_files = set(self.config.get('processed_files', []))
+        upload_log = self.load_upload_log()
+        if not upload_log.empty and 'source_path' in upload_log.columns:
+            processed_files.update(upload_log['source_path'].dropna().tolist())
+        
+        files_info = []
+        
+        # Scan for Excel and CSV files
+        for ext in ['*.xlsx', '*.csv', '*.xls']:
+            for file_path in folder_path.glob(ext):
+                # Skip temporary files
+                if file_path.name.startswith('~$'):
+                    continue
+                
+                # Parse filename
+                carrier, cycle = self.parse_filename(file_path.name)
+                
+                # Check if already processed
+                is_processed = str(file_path) in processed_files
+                
+                # Get file info
+                file_stat = file_path.stat()
+                file_size_mb = file_stat.st_size / (1024 * 1024)
+                modified_date = datetime.fromtimestamp(file_stat.st_mtime)
+                
+                files_info.append({
+                    'path': str(file_path),
+                    'filename': file_path.name,
+                    'carrier': carrier,
+                    'cycle_period': cycle,
+                    'size_mb': round(file_size_mb, 2),
+                    'modified_date': modified_date,
+                    'is_processed': is_processed,
+                    'parse_success': carrier is not None and cycle is not None
+                })
+        
+        # Sort by modified date (newest first)
+        files_info.sort(key=lambda x: x['modified_date'], reverse=True)
+        
+        return files_info, None
+    
+    def process_file_from_path(self, file_path, carrier_name, cycle_period, replace_existing=False):
+        """
+        Process a carrier file from a file path (instead of uploaded file).
+        """
+        try:
+            file_path = Path(file_path)
+            
+            if not file_path.exists():
+                return False, f"File not found: {file_path}"
+            
+            # Check for existing data
+            has_existing, existing_count = self.check_existing_data(carrier_name, cycle_period)
+            
+            if has_existing and not replace_existing:
+                return False, f"Data already exists for {carrier_name} - {cycle_period} ({existing_count:,} records). Use 'Replace Existing Data' option to update."
+            
+            # Read file
+            file_size_mb = file_path.stat().st_size / (1024 * 1024)
+            
+            # Remove existing data if replacing
+            if replace_existing and has_existing:
+                self.remove_existing_data(carrier_name, cycle_period)
+            
+            # Read file content for hash
+            with open(file_path, 'rb') as f:
+                file_content = f.read()
+            file_hash = self.get_file_hash(file_content)
+            
+            # Read into DataFrame
+            if str(file_path).endswith('.xlsx') or str(file_path).endswith('.xls'):
+                df = pd.read_excel(file_path, engine='openpyxl')
+            elif str(file_path).endswith('.csv'):
+                if file_size_mb > 10:
+                    chunk_list = []
+                    chunk_size = 10000
+                    for chunk in pd.read_csv(file_path, chunksize=chunk_size):
+                        chunk_list.append(chunk)
+                    df = pd.concat(chunk_list, ignore_index=True)
+                else:
+                    df = pd.read_csv(file_path)
+            else:
+                return False, "Unsupported file format. Please use Excel or CSV."
+            
+            # Clean up DataFrame
+            df = df.dropna(axis=1, how='all')
+            df = df.dropna(axis=0, how='all')
+            
+            # Remove columns that are mostly empty (>95% null)
+            null_threshold = 0.95
+            null_percentages = df.isnull().mean()
+            cols_to_keep = null_percentages[null_percentages < null_threshold].index
+            df = df[cols_to_keep]
+            
+            # Auto-detect columns
+            standard_columns = {
+                'client': [
+                    'client', 'customer', 'customer_name', 'account', 'consignee', 
+                    'shipper', 'company', 'client_name', 'customer name', 'account name'
+                ],
+                'tracking_number': [
+                    'tracking', 'tracking_number', 'tracking_id', 'awb', 'pro', 
+                    'tracking number', 'tracking id', 'shipment id', 'reference'
+                ],
+                'service_type': [
+                    'service', 'service_type', 'service_level', 'service type',
+                    'service level', 'shipping service', 'delivery service'
+                ],
+                'cost': [
+                    'cost', 'freight_cost', 'shipping_cost', 'carrier_charge', 
+                    'total_cost', 'total cost', 'freight cost', 'shipping cost',
+                    'carrier cost', 'transport cost', 'delivery cost'
+                ],
+                'billable_amount': [
+                    'billable', 'billable_amount', 'revenue', 'charge_amount', 
+                    'bill_amount', 'invoice_amount', 'billable amount', 'bill amount',
+                    'invoice amount', 'charge amount', 'total billable', 'total_billable'
+                ],
+                'weight': [
+                    'weight', 'package_weight', 'total_weight', 'package weight',
+                    'total weight', 'shipment weight', 'gross weight'
+                ],
+                'zone': [
+                    'zone', 'delivery_zone', 'shipping_zone', 'delivery zone',
+                    'shipping zone', 'service zone'
+                ],
+                'ship_date': [
+                    'date', 'ship_date', 'pickup_date', 'service_date', 'ship date',
+                    'pickup date', 'service date', 'shipment date', 'send date'
+                ],
+                'delivery_date': [
+                    'delivery_date', 'delivered_date', 'delivery', 'delivery date',
+                    'delivered date', 'arrival date', 'completion date'
+                ]
+            }
+            
+            column_map = {}
+            df_columns_lower = {col: col.lower().strip().replace(' ', '').replace('_', '') for col in df.columns}
+            
+            for standard, variants in standard_columns.items():
+                for original_col, clean_col in df_columns_lower.items():
+                    clean_variants = [v.lower().replace(' ', '').replace('_', '') for v in variants]
+                    if clean_col in clean_variants:
+                        column_map[original_col] = standard
+                        break
+            
+            df = df.rename(columns=column_map)
+            
+            # Verify required columns
+            required_cols = ['client', 'cost', 'billable_amount']
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                available_cols = list(df.columns)
+                return False, f"Missing required columns: {missing_cols}. Available columns: {available_cols}"
+            
+            # Create standardized DataFrame
+            STANDARD_COLUMNS = [
+                'carrier', 'client', 'tracking_number', 'service_type', 
+                'cost', 'billable_amount', 'weight', 'zone', 
+                'ship_date', 'delivery_date', 'invoice_status', 
+                'invoice_number', 'invoice_date', 'cycle_period', 
+                'upload_timestamp', 'file_hash'
+            ]
+            
+            standardized_data = []
+            
+            for index, row in df.iterrows():
+                standard_row = {
+                    'carrier': carrier_name,
+                    'client': str(row.get('client', '')).strip(),
+                    'tracking_number': str(row.get('tracking_number', '')).strip(),
+                    'service_type': str(row.get('service_type', '')).strip(),
+                    'cost': pd.to_numeric(row.get('cost', 0), errors='coerce'),
+                    'billable_amount': pd.to_numeric(row.get('billable_amount', 0), errors='coerce'),
+                    'weight': pd.to_numeric(row.get('weight'), errors='coerce'),
+                    'zone': str(row.get('zone', '')).strip(),
+                    'ship_date': pd.to_datetime(row.get('ship_date'), errors='coerce'),
+                    'delivery_date': pd.to_datetime(row.get('delivery_date'), errors='coerce'),
+                    'invoice_status': 'Ready to Bill',
+                    'invoice_number': '',
+                    'invoice_date': pd.to_datetime(row.get('invoice_date'), errors='coerce'),
+                    'cycle_period': cycle_period,
+                    'upload_timestamp': datetime.now(),
+                    'file_hash': file_hash
+                }
+                standardized_data.append(standard_row)
+            
+            standardized_df = pd.DataFrame(standardized_data, columns=STANDARD_COLUMNS)
+            
+            # Remove rows with missing critical data
+            initial_count = len(standardized_df)
+            standardized_df = standardized_df.dropna(subset=['cost', 'billable_amount'])
+            standardized_df = standardized_df[
+                (standardized_df['cost'] != 0) | (standardized_df['billable_amount'] != 0)
+            ]
+            final_count = len(standardized_df)
+            
+            if final_count == 0:
+                return False, "No valid records found with both costs and billable amount data."
+            
+            # Handle existing data
+            existing_shipments = self.load_shipment_data()
+            
+            if not existing_shipments.empty:
+                existing_standardized = pd.DataFrame(columns=STANDARD_COLUMNS)
+                
+                for col in STANDARD_COLUMNS:
+                    if col in existing_shipments.columns:
+                        existing_standardized[col] = existing_shipments[col]
+                    else:
+                        if col in ['ship_date', 'delivery_date', 'invoice_date']:
+                            existing_standardized[col] = pd.NaT
+                        elif col in ['cost', 'billable_amount', 'weight']:
+                            existing_standardized[col] = 0
+                        else:
+                            existing_standardized[col] = ''
+                
+                combined_shipments = pd.concat([existing_standardized, standardized_df], ignore_index=True)
+            else:
+                combined_shipments = standardized_df
+            
+            self.save_shipment_data(combined_shipments)
+            
+            # Update upload log with source path
+            upload_log = self.load_upload_log()
+            
+            new_log_entry = pd.DataFrame([{
+                'filename': file_path.name,
+                'file_hash': file_hash,
+                'upload_date': datetime.now(),
+                'records_imported': final_count,
+                'carrier': carrier_name,
+                'cycle_period': cycle_period,
+                'status': 'Active',
+                'deleted_date': None,
+                'source_path': str(file_path)
+            }])
+            
+            if not upload_log.empty:
+                if 'status' not in upload_log.columns:
+                    upload_log['status'] = 'Active'
+                if 'deleted_date' not in upload_log.columns:
+                    upload_log['deleted_date'] = None
+                if 'source_path' not in upload_log.columns:
+                    upload_log['source_path'] = None
+            
+            combined_log = pd.concat([upload_log, new_log_entry], ignore_index=True)
+            self.save_upload_log(combined_log)
+            
+            # Update billing checklist
+            self.update_billing_checklist(standardized_df)
+            
+            # Mark file as processed
+            if str(file_path) not in self.config.get('processed_files', []):
+                if 'processed_files' not in self.config:
+                    self.config['processed_files'] = []
+                self.config['processed_files'].append(str(file_path))
+                self.save_config()
+            
+            message = f"Successfully {'replaced' if replace_existing and has_existing else 'imported'} {final_count:,} shipments for {carrier_name} ({file_size_mb:.1f} MB)"
+            if replace_existing and has_existing:
+                message += f" (replaced {existing_count:,} existing records)"
+            if initial_count != final_count:
+                message += f" (removed {initial_count - final_count:,} records with missing data)"
+            
+            return True, message
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return False, f"Error processing file: {str(e)}"
+    
+    def mark_file_as_processed(self, file_path):
+        """Mark a file as processed without actually processing it"""
+        if str(file_path) not in self.config.get('processed_files', []):
+            if 'processed_files' not in self.config:
+                self.config['processed_files'] = []
+            self.config['processed_files'].append(str(file_path))
+            self.save_config()
+    
+    def unmark_file_as_processed(self, file_path):
+        """Remove a file from the processed list"""
+        if 'processed_files' in self.config:
+            try:
+                self.config['processed_files'].remove(str(file_path))
+                self.save_config()
+            except ValueError:
+                pass
     
     def get_file_hash(self, file_content):
         """Generate hash for uploaded file to prevent duplicates"""
@@ -334,7 +759,8 @@ class FreightBillingChecker:
                 'carrier': carrier_name,
                 'cycle_period': cycle_period,
                 'status': 'Active',
-                'deleted_date': None
+                'deleted_date': None,
+                'source_path': None  # Manual upload, no source path
             }])
         
             # Ensure upload log structure consistency
@@ -343,6 +769,8 @@ class FreightBillingChecker:
                     upload_log['status'] = 'Active'
                 if 'deleted_date' not in upload_log.columns:
                     upload_log['deleted_date'] = None
+                if 'source_path' not in upload_log.columns:
+                    upload_log['source_path'] = None
         
             combined_log = pd.concat([upload_log, new_log_entry], ignore_index=True)
             self.save_upload_log(combined_log)
@@ -557,7 +985,6 @@ class FreightBillingChecker:
                 totals.to_excel(writer, sheet_name='Summary_Totals', index=False)
         
         return output.getvalue()
-    # Add these methods to your FreightBillingChecker class:
 
     def delete_carrier_data(self, carrier_name, cycle_period):
         """Delete all data for a specific carrier/cycle combination"""
@@ -601,7 +1028,7 @@ class FreightBillingChecker:
             return False, f"Error deleting data: {str(e)}"
 
     def delete_client_cycle(self, client_name, cycle_period):
-        """Delete all data for a client in a specific cycle (all carriers)"""
+        """Delete all data for a specific client/cycle combination (all carriers)"""
         try:
             # Remove from shipment data
             shipment_data = self.load_shipment_data()
@@ -624,38 +1051,50 @@ class FreightBillingChecker:
             return True, f"Successfully deleted all data for {client_name} - {cycle_period}"
             
         except Exception as e:
-            return False, f"Error deleting client data: {str(e)}"
+            return False, f"Error deleting data: {str(e)}"
 
     def get_data_summary(self):
-        """Get summary of all data for management view"""
+        """Get summary of all uploaded data grouped by carrier/cycle"""
         shipment_data = self.load_shipment_data()
         
         if shipment_data.empty:
             return pd.DataFrame()
         
-        # Group by carrier, client, and cycle
-        summary = shipment_data.groupby(['carrier', 'client', 'cycle_period']).agg({
+        summary = shipment_data.groupby(['carrier', 'cycle_period', 'client']).agg({
             'tracking_number': 'count',
             'cost': 'sum',
             'billable_amount': 'sum',
-            'upload_timestamp': 'min'  # First upload timestamp
+            'upload_timestamp': 'max'
         }).reset_index()
         
-        summary.rename(columns={'tracking_number': 'shipment_count'}, inplace=True)
-        summary['profit'] = summary['billable_amount'] - summary['cost']
-        summary['upload_date'] = pd.to_datetime(summary['upload_timestamp']).dt.date
+        summary.rename(columns={
+            'tracking_number': 'shipment_count',
+            'upload_timestamp': 'upload_date'
+        }, inplace=True)
         
-        return summary.sort_values(['cycle_period', 'client', 'carrier'], ascending=[False, True, True])
+        summary['profit'] = summary['billable_amount'] - summary['cost']
+        
+        return summary.sort_values(['cycle_period', 'carrier', 'client'], ascending=[False, True, True])
 
     def clear_all_data(self, confirmation_code):
-        """Clear all data with confirmation code"""
+        """Clear all data after confirmation"""
         if confirmation_code != "DELETE_ALL_BILLING_DATA":
             return False, "Invalid confirmation code"
         
         try:
-            # Clear all files by recreating them
+            # Reset all Excel files
+            self.shipment_data_file.unlink(missing_ok=True)
+            self.billing_checklist_file.unlink(missing_ok=True)
+            self.upload_log_file.unlink(missing_ok=True)
+            
+            # Clear processed files list
+            self.config['processed_files'] = []
+            self.save_config()
+            
+            # Reinitialize
             self.init_excel_files()
-            return True, "All billing data has been cleared"
+            
+            return True, "All data cleared successfully"
         except Exception as e:
             return False, f"Error clearing data: {str(e)}"
 
@@ -664,38 +1103,48 @@ class FreightBillingChecker:
         try:
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                # All data
+                # Shipment data
                 shipment_data = self.load_shipment_data()
-                billing_checklist = self.load_billing_checklist()
-                upload_log = self.load_upload_log()
-                
                 if not shipment_data.empty:
-                    shipment_data.to_excel(writer, sheet_name='All_Shipments', index=False)
-                if not billing_checklist.empty:
-                    billing_checklist.to_excel(writer, sheet_name='Billing_Checklist', index=False)
+                    shipment_data.to_excel(writer, sheet_name='Shipment_Data', index=False)
+                
+                # Billing checklist
+                checklist = self.load_billing_checklist()
+                if not checklist.empty:
+                    checklist.to_excel(writer, sheet_name='Billing_Checklist', index=False)
+                
+                # Upload log
+                upload_log = self.load_upload_log()
                 if not upload_log.empty:
-                    upload_log.to_excel(writer, sheet_name='Upload_History', index=False)
+                    upload_log.to_excel(writer, sheet_name='Upload_Log', index=False)
             
             return output.getvalue()
         except Exception as e:
+            print(f"Error creating backup: {e}")
             return None
 
-# Streamlit Web Interface
+
+# ============================================================================
+# STREAMLIT UI
+# ============================================================================
+
 def main():
     st.set_page_config(
-        page_title="Freight Billing Checklist",
+        page_title="Freight Billing Tracker",
         page_icon="📋",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
-    # Configure for large files
+    # Custom CSS
     st.markdown("""
     <style>
-    .uploadedFile {
-        max-height: 200px;
-        overflow-y: auto;
-    }
+    .main-header {font-size: 2.5rem; font-weight: bold; color: #1E88E5;}
+    .metric-card {background-color: #f8f9fa; padding: 1rem; border-radius: 0.5rem;}
+    .status-ready {color: #28a745; font-weight: bold;}
+    .status-billed {color: #6c757d; font-weight: bold;}
+    .file-new {background-color: #d4edda; padding: 0.5rem; border-radius: 0.25rem; margin: 0.25rem 0;}
+    .file-processed {background-color: #f8f9fa; padding: 0.5rem; border-radius: 0.25rem; margin: 0.25rem 0;}
     </style>
     """, unsafe_allow_html=True)
     
@@ -713,11 +1162,13 @@ def main():
     st.sidebar.title("Navigation")
     page = st.sidebar.selectbox(
         "Choose a page:",
-        ["📊 Billing Dashboard", "📤 Upload Carrier Data", "📋 Client Billing Checklist", "🚚 Carrier Breakdown", "📈 Reports", "🗂️ Data Management","⚙️ Settings"]
+        ["📊 Billing Dashboard", "📂 Scan Folder", "📤 Upload Carrier Data", "📋 Client Billing Checklist", "🚚 Carrier Breakdown", "📈 Reports", "🗂️ Data Management", "⚙️ Settings"]
     )
     
     if page == "📊 Billing Dashboard":
         show_billing_dashboard(tracker)
+    elif page == "📂 Scan Folder":
+        show_scan_folder_page(tracker)
     elif page == "📤 Upload Carrier Data":
         show_upload_page(tracker)
     elif page == "📋 Client Billing Checklist":
@@ -730,6 +1181,282 @@ def main():
         show_data_management(tracker)
     elif page == "⚙️ Settings":
         show_settings(tracker)
+
+
+def show_scan_folder_page(tracker):
+    """Show the folder scanning page for semi-automatic file processing"""
+    st.header("📂 Scan Folder for Carrier Files")
+    st.markdown("*Automatically detect and process carrier files from a designated folder*")
+    
+    # Show current folder configuration
+    current_folder = tracker.get_input_folder()
+    
+    if not current_folder:
+        st.warning("⚠️ No input folder configured. Please set one in Settings or below.")
+        
+        with st.expander("🔧 Quick Setup - Configure Input Folder", expanded=True):
+            new_folder = st.text_input(
+                "📁 Input Folder Path",
+                placeholder=r"e.g., C:\BillingFiles or \\server\share\billing",
+                help="Enter the full path to the folder containing carrier files"
+            )
+            
+            if st.button("💾 Save Folder Path"):
+                if new_folder:
+                    tracker.set_input_folder(new_folder)
+                    st.success(f"✅ Input folder set to: {new_folder}")
+                    st.rerun()
+                else:
+                    st.error("Please enter a folder path")
+        return
+    
+    # Show folder info
+    st.info(f"📁 **Scanning folder:** `{current_folder}`")
+    
+    # Scan button
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        scan_button = st.button("🔄 Scan Folder", type="primary")
+    with col2:
+        show_processed = st.checkbox("Show processed files", value=False)
+    
+    # Scan folder
+    files_info, error = tracker.scan_input_folder()
+    
+    if error:
+        st.error(f"❌ {error}")
+        return
+    
+    if not files_info:
+        st.info("📋 No Excel or CSV files found in the folder.")
+        return
+    
+    # Filter files
+    if not show_processed:
+        display_files = [f for f in files_info if not f['is_processed']]
+    else:
+        display_files = files_info
+    
+    # Summary
+    new_files = len([f for f in files_info if not f['is_processed']])
+    processed_files = len([f for f in files_info if f['is_processed']])
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("📄 Total Files", len(files_info))
+    with col2:
+        st.metric("🆕 New Files", new_files)
+    with col3:
+        st.metric("✅ Processed", processed_files)
+    
+    st.markdown("---")
+    
+    if not display_files:
+        st.success("✅ All files have been processed!")
+        return
+    
+    # File naming convention help
+    with st.expander("💡 Filename Convention Help"):
+        st.markdown("""
+        **Recommended filename format:** `CarrierName_CyclePeriod.xlsx`
+        
+        **Examples:**
+        - `FedEx_2024-11.xlsx` → Carrier: FedEx, Cycle: 2024-11
+        - `UPS_November2024.csv` → Carrier: UPS, Cycle: 2024-11
+        - `DHL_2024-11-Week1.xlsx` → Carrier: DHL, Cycle: 2024-11-Week1
+        
+        Files that don't follow this convention can still be processed - you'll just need to manually enter the carrier and cycle.
+        """)
+    
+    st.subheader("📋 Files Found")
+    
+    # Process files section
+    if 'selected_files' not in st.session_state:
+        st.session_state.selected_files = {}
+    
+    # Select all / none buttons
+    col1, col2, col3 = st.columns([1, 1, 4])
+    with col1:
+        if st.button("☑️ Select All New"):
+            for f in display_files:
+                if not f['is_processed']:
+                    st.session_state.selected_files[f['path']] = True
+            st.rerun()
+    with col2:
+        if st.button("⬜ Clear Selection"):
+            st.session_state.selected_files = {}
+            st.rerun()
+    
+    # Display files
+    files_to_process = []
+    
+    for idx, file_info in enumerate(display_files):
+        file_key = f"file_{idx}"
+        
+        with st.container():
+            # File card
+            if file_info['is_processed']:
+                st.markdown(f"<div class='file-processed'>", unsafe_allow_html=True)
+            else:
+                st.markdown(f"<div class='file-new'>", unsafe_allow_html=True)
+            
+            col1, col2, col3, col4, col5 = st.columns([0.5, 3, 2, 2, 1.5])
+            
+            with col1:
+                if not file_info['is_processed']:
+                    selected = st.checkbox(
+                        "Select",
+                        key=f"select_{file_key}",
+                        value=st.session_state.selected_files.get(file_info['path'], False),
+                        label_visibility="collapsed"
+                    )
+                    st.session_state.selected_files[file_info['path']] = selected
+                else:
+                    st.write("✅")
+            
+            with col2:
+                st.write(f"**{file_info['filename']}**")
+                st.caption(f"Size: {file_info['size_mb']} MB | Modified: {file_info['modified_date'].strftime('%Y-%m-%d %H:%M')}")
+            
+            with col3:
+                if file_info['parse_success']:
+                    carrier_value = st.text_input(
+                        "Carrier",
+                        value=file_info['carrier'],
+                        key=f"carrier_{file_key}",
+                        disabled=file_info['is_processed'],
+                        label_visibility="collapsed"
+                    )
+                else:
+                    carrier_value = st.text_input(
+                        "Carrier (required)",
+                        placeholder="Enter carrier name",
+                        key=f"carrier_{file_key}",
+                        disabled=file_info['is_processed'],
+                        label_visibility="collapsed"
+                    )
+                file_info['carrier_input'] = carrier_value
+            
+            with col4:
+                if file_info['parse_success']:
+                    cycle_value = st.text_input(
+                        "Cycle",
+                        value=file_info['cycle_period'],
+                        key=f"cycle_{file_key}",
+                        disabled=file_info['is_processed'],
+                        label_visibility="collapsed"
+                    )
+                else:
+                    cycle_value = st.text_input(
+                        "Cycle (required)",
+                        placeholder="e.g., 2024-11",
+                        key=f"cycle_{file_key}",
+                        disabled=file_info['is_processed'],
+                        label_visibility="collapsed"
+                    )
+                file_info['cycle_input'] = cycle_value
+            
+            with col5:
+                if file_info['is_processed']:
+                    st.write("✅ Processed")
+                elif not file_info['parse_success']:
+                    st.write("⚠️ Manual entry")
+                else:
+                    st.write("🆕 Ready")
+            
+            # Track for processing
+            if st.session_state.selected_files.get(file_info['path'], False):
+                files_to_process.append(file_info)
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        st.markdown("---")
+    
+    # Process selected files
+    if files_to_process:
+        st.subheader(f"🚀 Process {len(files_to_process)} Selected File(s)")
+        
+        # Validate all have carrier/cycle
+        valid_files = []
+        invalid_files = []
+        
+        for f in files_to_process:
+            carrier = f.get('carrier_input', f.get('carrier', ''))
+            cycle = f.get('cycle_input', f.get('cycle_period', ''))
+            
+            if carrier and cycle:
+                valid_files.append({
+                    'path': f['path'],
+                    'filename': f['filename'],
+                    'carrier': carrier,
+                    'cycle': cycle
+                })
+            else:
+                invalid_files.append(f['filename'])
+        
+        if invalid_files:
+            st.warning(f"⚠️ The following files need carrier and cycle info: {', '.join(invalid_files)}")
+        
+        if valid_files:
+            # Replace existing option
+            replace_existing = st.checkbox(
+                "🔄 Replace existing data if found",
+                help="If data already exists for a carrier/cycle combination, replace it with the new file"
+            )
+            
+            # Preview what will be processed
+            with st.expander("📋 Preview Processing", expanded=True):
+                preview_df = pd.DataFrame(valid_files)
+                st.dataframe(preview_df[['filename', 'carrier', 'cycle']], use_container_width=True, hide_index=True)
+            
+            if st.button("🚀 Process Selected Files", type="primary"):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                results = []
+                
+                for i, file_info in enumerate(valid_files):
+                    status_text.text(f"Processing {file_info['filename']}...")
+                    
+                    success, message = tracker.process_file_from_path(
+                        file_info['path'],
+                        file_info['carrier'],
+                        file_info['cycle'],
+                        replace_existing=replace_existing
+                    )
+                    
+                    results.append({
+                        'filename': file_info['filename'],
+                        'success': success,
+                        'message': message
+                    })
+                    
+                    progress_bar.progress((i + 1) / len(valid_files))
+                
+                status_text.empty()
+                
+                # Show results
+                st.subheader("📊 Processing Results")
+                
+                success_count = sum(1 for r in results if r['success'])
+                fail_count = len(results) - success_count
+                
+                if success_count > 0:
+                    st.success(f"✅ Successfully processed {success_count} file(s)")
+                if fail_count > 0:
+                    st.error(f"❌ Failed to process {fail_count} file(s)")
+                
+                for result in results:
+                    if result['success']:
+                        st.write(f"✅ **{result['filename']}**: {result['message']}")
+                    else:
+                        st.write(f"❌ **{result['filename']}**: {result['message']}")
+                
+                # Clear selection
+                st.session_state.selected_files = {}
+                
+                if st.button("🔄 Refresh"):
+                    st.rerun()
+
 
 def show_billing_dashboard(tracker):
     """Show billing dashboard"""
@@ -803,10 +1530,11 @@ def show_billing_dashboard(tracker):
         
         st.dataframe(display_data, use_container_width=True, hide_index=True)
 
+
 def show_upload_page(tracker):
-    """Show carrier data upload page"""
+    """Show carrier data upload page (manual upload)"""
     st.header("📤 Upload Carrier Reconciliation Data")
-    st.markdown("*Upload carrier files containing cost and billable amounts*")
+    st.markdown("*Manual upload - for automated processing, use the Scan Folder page*")
     
     # File size warning
     st.info("💡 **Large File Support:** Files up to 50MB supported. Files over 10MB may take 1-2 minutes to process.")
@@ -832,7 +1560,7 @@ def show_upload_page(tracker):
                 st.success(f"✅ File selected: {uploaded_file.name} ({file_size_mb:.1f} MB)")
             
             # Show file preview for smaller files
-            if file_size_mb < 20:  # Only preview smaller files
+            if file_size_mb < 20:
                 try:
                     if uploaded_file.name.endswith('.xlsx'):
                         preview_df = pd.read_excel(uploaded_file, nrows=5)
@@ -892,7 +1620,6 @@ def show_upload_page(tracker):
         
         if st.button("🚀 Process File", type="primary"):
             if uploaded_file and carrier_name and cycle_period:
-                # Show processing message based on file size
                 file_size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
                 if file_size_mb > 20:
                     processing_msg = f"⏳ Processing large file ({file_size_mb:.1f} MB)... This may take 2-3 minutes."
@@ -901,192 +1628,54 @@ def show_upload_page(tracker):
                 else:
                     processing_msg = "⏳ Processing file..."
                 
-                if replace_existing:
-                    processing_msg = processing_msg.replace("Processing", "Replacing existing data and processing")
-                
                 with st.spinner(processing_msg):
-                    # Add progress bar for large files
-                    if file_size_mb > 10:
-                        progress_bar = st.progress(0)
-                        progress_bar.progress(25)  # File reading
-                    
+                    uploaded_file.seek(0)
                     success, message = tracker.process_carrier_file(
-                        uploaded_file, carrier_name, cycle_period, replace_existing=replace_existing
+                        uploaded_file, 
+                        carrier_name, 
+                        cycle_period,
+                        replace_existing=replace_existing
                     )
                     
-                    if file_size_mb > 10:
-                        progress_bar.progress(100)  # Complete
-                
-                if success:
-                    if replace_existing:
-                        st.success(f"🔄 {message}")
-                    else:
+                    if success:
                         st.success(f"✅ {message}")
-                    st.balloons()
-                    st.rerun()
-                else:
-                    st.error(f"❌ {message}")
+                        st.balloons()
+                    else:
+                        st.error(f"❌ {message}")
             else:
-                st.error("❌ Please provide all required information")
-    
-    # Upload history
-    st.markdown("---")
-    st.subheader("📝 Recent Uploads")
-    
-    upload_history = tracker.load_upload_log()
-    if not upload_history.empty:
-        recent_uploads = upload_history.sort_values('upload_date', ascending=False).head(10)
-        
-        # Format upload date
-        display_uploads = recent_uploads.copy()
-        display_uploads['upload_date'] = pd.to_datetime(display_uploads['upload_date']).dt.strftime('%Y-%m-%d %H:%M')
-        
-        st.dataframe(
-            display_uploads[['filename', 'carrier', 'cycle_period', 'records_imported', 'upload_date']], 
-            use_container_width=True, 
-            hide_index=True
-        )
-    else:
-        st.info("📋 No upload history yet")
+                st.error("Please fill in all required fields")
+
 
 def show_client_checklist(tracker):
     """Show client billing checklist"""
     st.header("📋 Client Billing Checklist")
-    st.markdown("*Cross-reference these totals when building client invoices*")
     
-    # Get client summary
     client_summary = tracker.get_client_summary()
     
     if client_summary.empty:
         st.info("📋 No billing data available")
         return
     
-    # Filter section
+    # Filters
     col1, col2 = st.columns(2)
     
     with col1:
         cycles = ['All'] + list(client_summary['cycle_period'].unique())
-        selected_cycle = st.selectbox("📅 Billing Cycle", cycles)
+        selected_cycle = st.selectbox("📅 Filter by Cycle", cycles)
     
     with col2:
-        status_filter = st.selectbox(
-            "📊 Status",
-            ['All', 'Ready to Bill', 'Billed']
-        )
+        clients = ['All'] + list(client_summary['client'].unique())
+        selected_client = st.selectbox("👤 Filter by Client", clients)
     
     # Apply filters
-    filtered_summary = client_summary.copy()
-    if selected_cycle != 'All':
-        filtered_summary = filtered_summary[filtered_summary['cycle_period'] == selected_cycle]
-    if status_filter != 'All':
-        filtered_summary = filtered_summary[filtered_summary['invoice_status'] == status_filter]
-    
-    # Display client checklist
-    if not filtered_summary.empty:
-        st.subheader("💰 Client Invoice Totals")
-        
-        # Format for display
-        display_data = filtered_summary.copy()
-        for col in ['total_cost', 'total_billable', 'profit']:
-            display_data[col] = display_data[col].apply(lambda x: f"${x:,.2f}")
-        display_data['profit_margin'] = display_data['profit_margin'].apply(lambda x: f"{x:.1f}%")
-        
-        st.dataframe(display_data, use_container_width=True, hide_index=True)
-        
-        # Summary totals
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("📦 Total Shipments", filtered_summary['shipment_count'].sum())
-        with col2:
-            st.metric("💰 Total to Bill", f"${filtered_summary['total_billable'].sum():,.2f}")
-        with col3:
-            st.metric("📈 Average Margin", f"{filtered_summary['profit_margin'].mean():.1f}%")
-    
-    # Mark as billed section
-    st.markdown("---")
-    st.subheader("✅ Mark Client as Billed")
-    
-    with st.form("mark_billed"):
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            ready_clients = client_summary[client_summary['invoice_status'] == 'Ready to Bill']
-            if not ready_clients.empty:
-                client_options = ready_clients['client'].unique()
-                bill_client = st.selectbox("👤 Client", client_options)
-            else:
-                st.info("No clients ready to bill")
-                bill_client = None
-        
-        with col2:
-            if bill_client:
-                cycle_options = ready_clients[ready_clients['client'] == bill_client]['cycle_period'].unique()
-                bill_cycle = st.selectbox("📅 Cycle", cycle_options)
-                
-                # Show totals for this client/cycle
-                client_total = ready_clients[
-                    (ready_clients['client'] == bill_client) & 
-                    (ready_clients['cycle_period'] == bill_cycle)
-                ]
-                if not client_total.empty:
-                    total_amount = client_total['total_billable'].iloc[0]
-                    st.info(f"💰 Total: ${total_amount:,.2f}")
-            else:
-                bill_cycle = None
-        
-        with col3:
-            invoice_number = st.text_input("📄 Invoice Number")
-        
-        notes = st.text_area("📝 Notes", placeholder="Optional notes...")
-        
-        if st.form_submit_button("✅ Mark as Billed"):
-            if bill_client and bill_cycle and invoice_number:
-                tracker.mark_client_billed(bill_client, bill_cycle, invoice_number, notes=notes)
-                st.success("✅ Client marked as billed!")
-                st.rerun()
-            else:
-                st.error("❌ Please fill in all required fields")
-
-def show_carrier_breakdown(tracker):
-    """Show carrier breakdown for cross-referencing"""
-    st.header("🚚 Carrier Breakdown by Client")
-    st.markdown("*Detailed breakdown by carrier for cross-referencing your reconciliations*")
-    
-    # Get detailed checklist
-    detailed_checklist = tracker.get_billing_checklist()
-    
-    if detailed_checklist.empty:
-        st.info("📋 No data available")
-        return
-    
-    # Filter section
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        cycles = ['All'] + list(detailed_checklist['cycle_period'].unique())
-        selected_cycle = st.selectbox("📅 Cycle", cycles)
-    
-    with col2:
-        clients = ['All'] + list(detailed_checklist['client'].unique())
-        selected_client = st.selectbox("👤 Client", clients)
-    
-    with col3:
-        carriers = ['All'] + list(detailed_checklist['carrier'].unique())
-        selected_carrier = st.selectbox("🚚 Carrier", carriers)
-    
-    # Apply filters
-    filtered_data = detailed_checklist.copy()
+    filtered_data = client_summary.copy()
     if selected_cycle != 'All':
         filtered_data = filtered_data[filtered_data['cycle_period'] == selected_cycle]
     if selected_client != 'All':
         filtered_data = filtered_data[filtered_data['client'] == selected_client]
-    if selected_carrier != 'All':
-        filtered_data = filtered_data[filtered_data['carrier'] == selected_carrier]
     
-    # Display breakdown
+    # Display data
     if not filtered_data.empty:
-        st.subheader("📊 Carrier-Client Breakdown")
-        
         # Format for display
         display_data = filtered_data.copy()
         for col in ['total_cost', 'total_billable', 'profit']:
@@ -1095,103 +1684,95 @@ def show_carrier_breakdown(tracker):
         
         st.dataframe(display_data, use_container_width=True, hide_index=True)
         
-        # Add pie chart for shipments by carrier
+        # Mark as billed section
         st.markdown("---")
+        st.subheader("✅ Mark Client as Billed")
         
-        # Create two columns for charts
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Pie chart showing shipments by carrier
-            carrier_shipments = filtered_data.groupby('carrier')['shipment_count'].sum().reset_index()
-            if len(carrier_shipments) > 1:
-                fig_pie = px.pie(
-                    carrier_shipments,
-                    values='shipment_count',
-                    names='carrier',
-                    title="📦 Shipments by Carrier",
-                    color_discrete_sequence=px.colors.qualitative.Set3
-                )
-                fig_pie.update_traces(
-                    textposition='inside', 
-                    textinfo='percent+label',
-                    hovertemplate='<b>%{label}</b><br>Shipments: %{value:,}<br>Percentage: %{percent}<extra></extra>'
-                )
-                st.plotly_chart(fig_pie, use_container_width=True)
-            else:
-                st.info("📊 Pie chart requires multiple carriers to display")
-        
-        with col2:
-            # Bar chart showing billable amounts by carrier
-            carrier_billable = filtered_data.groupby('carrier')['total_billable'].sum().reset_index()
-            if not carrier_billable.empty:
-                fig_bar = px.bar(
-                    carrier_billable,
-                    x='carrier',
-                    y='total_billable',
-                    title="💰 Billable Amount by Carrier",
-                    color='total_billable',
-                    color_continuous_scale='Blues'
-                )
-                fig_bar.update_layout(
-                    xaxis_title="Carrier",
-                    yaxis_title="Billable Amount ($)",
-                    showlegend=False
-                )
-                fig_bar.update_traces(
-                    hovertemplate='<b>%{x}</b><br>Billable: $%{y:,.2f}<extra></extra>'
-                )
-                st.plotly_chart(fig_bar, use_container_width=True)
-        
-        # Summary by carrier
-        if selected_client != 'All' and selected_cycle != 'All':
-            st.markdown("---")
-            st.subheader(f"📋 Summary for {selected_client} - {selected_cycle}")
+        with st.form("mark_billed_form"):
+            col1, col2, col3 = st.columns(3)
             
-            carrier_totals = filtered_data.groupby('carrier').agg({
-                'shipment_count': 'sum',
-                'total_cost': 'sum',
-                'total_billable': 'sum'
-            }).reset_index()
-            carrier_totals['profit'] = carrier_totals['total_billable'] - carrier_totals['total_cost']
+            with col1:
+                bill_client = st.selectbox("👤 Client", filtered_data['client'].unique())
             
-            # Format totals
-            display_totals = carrier_totals.copy()
-            for col in ['total_cost', 'total_billable', 'profit']:
-                display_totals[col] = display_totals[col].apply(lambda x: f"${x:,.2f}")
+            with col2:
+                bill_cycle = st.selectbox("📅 Cycle", filtered_data['cycle_period'].unique())
             
-            st.dataframe(display_totals, use_container_width=True, hide_index=True)
+            with col3:
+                invoice_number = st.text_input("📄 Invoice Number")
+            
+            if st.form_submit_button("✅ Mark as Billed"):
+                if invoice_number:
+                    tracker.mark_client_billed(bill_client, bill_cycle, invoice_number)
+                    st.success(f"✅ Marked {bill_client} - {bill_cycle} as billed")
+                    st.rerun()
+                else:
+                    st.error("Please enter an invoice number")
+
+
+def show_carrier_breakdown(tracker):
+    """Show carrier breakdown page"""
+    st.header("🚚 Carrier Breakdown")
     
-    # Shipment details section
-    if selected_client != 'All' and selected_cycle != 'All':
-        st.markdown("---")
-        st.subheader("📦 Shipment Details")
-        
-        if selected_carrier != 'All':
-            shipment_details = tracker.get_shipment_details(
-                client=selected_client, 
-                carrier=selected_carrier, 
-                cycle_period=selected_cycle
-            )
+    checklist = tracker.get_billing_checklist()
+    
+    if checklist.empty:
+        st.info("📋 No billing data available")
+        return
+    
+    # Filters
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        clients = ['All'] + list(checklist['client'].unique())
+        selected_client = st.selectbox("👤 Client", clients)
+    
+    with col2:
+        if selected_client != 'All':
+            cycles = ['All'] + list(checklist[checklist['client'] == selected_client]['cycle_period'].unique())
         else:
-            shipment_details = tracker.get_shipment_details(
-                client=selected_client, 
-                cycle_period=selected_cycle
-            )
-        
-        if not shipment_details.empty:
-            # Select relevant columns
-            detail_cols = [
-                'carrier', 'tracking_number', 'service_type', 'ship_date',
-                'cost', 'billable_amount'
-            ]
-            display_details = shipment_details[detail_cols].copy()
-            
-            # Format currency columns
-            display_details['cost'] = display_details['cost'].apply(lambda x: f"${x:,.2f}")
-            display_details['billable_amount'] = display_details['billable_amount'].apply(lambda x: f"${x:,.2f}")
-            
-            st.dataframe(display_details, use_container_width=True, hide_index=True)
+            cycles = ['All'] + list(checklist['cycle_period'].unique())
+        selected_cycle = st.selectbox("📅 Cycle", cycles)
+    
+    with col3:
+        carriers = ['All'] + list(checklist['carrier'].unique())
+        selected_carrier = st.selectbox("🚚 Carrier", carriers)
+    
+    # Apply filters
+    filtered_data = checklist.copy()
+    if selected_client != 'All':
+        filtered_data = filtered_data[filtered_data['client'] == selected_client]
+    if selected_cycle != 'All':
+        filtered_data = filtered_data[filtered_data['cycle_period'] == selected_cycle]
+    if selected_carrier != 'All':
+        filtered_data = filtered_data[filtered_data['carrier'] == selected_carrier]
+    
+    if filtered_data.empty:
+        st.info("No data matching filters")
+        return
+    
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("📦 Total Shipments", f"{filtered_data['shipment_count'].sum():,}")
+    with col2:
+        st.metric("💸 Total Cost", f"${filtered_data['total_cost'].sum():,.2f}")
+    with col3:
+        st.metric("💰 Total Billable", f"${filtered_data['total_billable'].sum():,.2f}")
+    with col4:
+        st.metric("📈 Total Profit", f"${filtered_data['profit'].sum():,.2f}")
+    
+    # Data table
+    st.subheader("📋 Carrier Details")
+    display_data = filtered_data.copy()
+    for col in ['total_cost', 'total_billable', 'profit']:
+        if col in display_data.columns:
+            display_data[col] = display_data[col].apply(lambda x: f"${x:,.2f}")
+    if 'profit_margin' in display_data.columns:
+        display_data['profit_margin'] = display_data['profit_margin'].apply(lambda x: f"{x:.1f}%")
+    
+    st.dataframe(display_data, use_container_width=True, hide_index=True)
+
 
 def show_reports(tracker):
     """Show reports page"""
@@ -1229,7 +1810,6 @@ def show_reports(tracker):
         
         client_summary = tracker.get_client_summary()
         if not client_summary.empty:
-            # Summary by cycle
             cycle_summary = client_summary.groupby('cycle_period').agg({
                 'shipment_count': 'sum',
                 'total_cost': 'sum',
@@ -1240,7 +1820,6 @@ def show_reports(tracker):
                 cycle_summary['profit'] / cycle_summary['total_billable'] * 100
             ).round(2)
             
-            # Format for display
             display_summary = cycle_summary.copy()
             for col in ['total_cost', 'total_billable', 'profit']:
                 display_summary[col] = display_summary[col].apply(lambda x: f"${x:,.2f}")
@@ -1253,7 +1832,6 @@ def show_reports(tracker):
         
         detailed_checklist = tracker.get_billing_checklist()
         if not detailed_checklist.empty:
-            # Performance by carrier
             carrier_performance = detailed_checklist.groupby('carrier').agg({
                 'shipment_count': 'sum',
                 'total_cost': 'sum',
@@ -1266,7 +1844,6 @@ def show_reports(tracker):
             
             st.dataframe(carrier_performance, use_container_width=True, hide_index=True)
             
-            # Chart
             fig = px.bar(
                 carrier_performance, 
                 x='carrier', 
@@ -1275,80 +1852,22 @@ def show_reports(tracker):
             )
             st.plotly_chart(fig, use_container_width=True)
 
-def show_settings(tracker):
-    """Show settings page"""
-    st.header("⚙️ Settings")
-    
-    st.subheader("📁 Data Files")
-    st.write(f"**Data Location:** {tracker.data_folder}")
-    
-    # File status
-    files = [
-        ("📦 Shipment Data", tracker.shipment_data_file),
-        ("📋 Billing Checklist", tracker.billing_checklist_file),
-        ("📝 Upload Log", tracker.upload_log_file)
-    ]
-    
-    for name, path in files:
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            if path.exists():
-                st.success(f"✅ {name}")
-                # Show record count
-                try:
-                    if 'shipment' in str(path):
-                        df = tracker.load_shipment_data()
-                    elif 'checklist' in str(path):
-                        df = tracker.load_billing_checklist()
-                    else:
-                        df = tracker.load_upload_log()
-                    st.caption(f"📊 {len(df)} records")
-                except:
-                    st.caption("📊 Error reading")
-            else:
-                st.error(f"❌ {name}")
-        with col2:
-            st.code(str(path))
-    
-    # Help section
-    st.markdown("---")
-    st.subheader("❓ Column Detection Help")
-    
-    with st.expander("🔧 Supported Column Names"):
-        st.markdown("""
-        **The system automatically detects these column variations:**
-        
-        - **Client:** `client`, `customer`, `customer_name`, `account`, `consignee`, `shipper`, `company`, `client_name`, `customer name`, `account name`
-        - **Cost:** `cost`, `freight_cost`, `shipping_cost`, `carrier_charge`, `total_cost`, `total cost`, `freight cost`, `shipping cost`, `carrier cost`, `transport cost`, `delivery cost`
-        - **Billable Amount:** `billable`, `billable_amount`, `revenue`, `charge_amount`, `bill_amount`, `invoice_amount`, `billable amount`, `bill amount`, `invoice amount`, `charge amount`, `total billable`, `total_billable`
-        - **Tracking:** `tracking`, `tracking_number`, `tracking_id`, `awb`, `pro`, `tracking number`, `tracking id`, `shipment id`, `reference`
-        - **Service:** `service`, `service_type`, `service_level`, `service type`, `service level`, `shipping service`, `delivery service`
-        - **Weight:** `weight`, `package_weight`, `total_weight`, `package weight`, `total weight`, `shipment weight`, `gross weight`
-        - **Zone:** `zone`, `delivery_zone`, `shipping_zone`, `delivery zone`, `shipping zone`, `service zone`
-        - **Dates:** `date`, `ship_date`, `pickup_date`, `service_date`, `ship date`, `pickup date`, `service date`, `shipment date`, `send date`, `delivery_date`, `delivered_date`, `delivery`, `delivery date`, `delivered date`, `arrival date`, `completion date`
-        """)
 
 def show_data_management(tracker):
-    """Show data management page for deleting/managing uploaded files"""
+    """Show data management page"""
     st.header("🗂️ Data Management")
-    st.markdown("*Manage uploaded carrier files and billing data*")
     
-    # Get data summary
     data_summary = tracker.get_data_summary()
     
     if data_summary.empty:
         st.info("📋 No data to manage")
         return
     
-    # Tabs for different management options
     tab1, tab2, tab3, tab4 = st.tabs(["🗑️ Delete Data", "📊 Data Overview", "💾 Backup", "⚠️ Reset All"])
     
     with tab1:
         st.subheader("🗑️ Delete Uploaded Data")
-        st.warning("⚠️ **Warning:** Deleting data cannot be undone. Consider backing up first.")
-        
-        # Option 1: Delete by carrier/cycle
-        st.markdown("### Delete by Carrier & Cycle")
+        st.warning("⚠️ Deleting data cannot be undone. Consider backing up first.")
         
         with st.form("delete_carrier_cycle"):
             col1, col2 = st.columns(2)
@@ -1364,215 +1883,160 @@ def show_data_management(tracker):
                 else:
                     delete_cycle = None
             
-            if delete_carrier and delete_cycle:
-                # Show what will be deleted
-                preview_data = data_summary[
-                    (data_summary['carrier'] == delete_carrier) & 
-                    (data_summary['cycle_period'] == delete_cycle)
-                ]
-                
-                if not preview_data.empty:
-                    st.markdown("**📋 Data to be deleted:**")
-                    display_preview = preview_data.copy()
-                    display_preview['cost'] = display_preview['cost'].apply(lambda x: f"${x:,.2f}")
-                    display_preview['billable_amount'] = display_preview['billable_amount'].apply(lambda x: f"${x:,.2f}")
-                    display_preview['profit'] = display_preview['profit'].apply(lambda x: f"${x:,.2f}")
-                    
-                    st.dataframe(display_preview[['client', 'shipment_count', 'cost', 'billable_amount', 'profit', 'upload_date']], 
-                               use_container_width=True, hide_index=True)
-                    
-                    # Confirmation
-                    confirm_delete = st.checkbox(f"✅ I confirm deletion of {delete_carrier} - {delete_cycle} data")
-                    
-                    if st.form_submit_button("🗑️ Delete Data", type="secondary"):
-                        if confirm_delete:
-                            success, message = tracker.delete_carrier_data(delete_carrier, delete_cycle)
-                            if success:
-                                st.success(f"✅ {message}")
-                                st.rerun()
-                            else:
-                                st.error(f"❌ {message}")
-                        else:
-                            st.error("❌ Please confirm deletion")
-        
-        # Option 2: Delete by client/cycle (all carriers)
-        st.markdown("---")
-        st.markdown("### Delete by Client & Cycle (All Carriers)")
-        
-        with st.form("delete_client_cycle"):
-            col1, col2 = st.columns(2)
+            confirm_delete = st.checkbox("✅ I confirm deletion")
             
-            with col1:
-                clients = list(data_summary['client'].unique())
-                delete_client = st.selectbox("👤 Select Client", clients)
-            
-            with col2:
-                if delete_client:
-                    cycles = data_summary[data_summary['client'] == delete_client]['cycle_period'].unique()
-                    delete_cycle_client = st.selectbox("📅 Select Cycle", cycles, key="client_cycle")
+            if st.form_submit_button("🗑️ Delete Data"):
+                if confirm_delete and delete_carrier and delete_cycle:
+                    success, message = tracker.delete_carrier_data(delete_carrier, delete_cycle)
+                    if success:
+                        st.success(f"✅ {message}")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {message}")
                 else:
-                    delete_cycle_client = None
-            
-            if delete_client and delete_cycle_client:
-                # Show what will be deleted
-                preview_data = data_summary[
-                    (data_summary['client'] == delete_client) & 
-                    (data_summary['cycle_period'] == delete_cycle_client)
-                ]
-                
-                if not preview_data.empty:
-                    st.markdown("**📋 Data to be deleted (all carriers):**")
-                    display_preview = preview_data.copy()
-                    display_preview['cost'] = display_preview['cost'].apply(lambda x: f"${x:,.2f}")
-                    display_preview['billable_amount'] = display_preview['billable_amount'].apply(lambda x: f"${x:,.2f}")
-                    display_preview['profit'] = display_preview['profit'].apply(lambda x: f"${x:,.2f}")
-                    
-                    st.dataframe(display_preview[['carrier', 'shipment_count', 'cost', 'billable_amount', 'profit', 'upload_date']], 
-                               use_container_width=True, hide_index=True)
-                    
-                    total_shipments = preview_data['shipment_count'].sum()
-                    total_billable = preview_data['billable_amount'].sum()
-                    st.info(f"📦 Total: {total_shipments:,} shipments, ${total_billable:,.2f} billable")
-                    
-                    # Confirmation
-                    confirm_delete_client = st.checkbox(f"✅ I confirm deletion of ALL {delete_client} data for {delete_cycle_client}")
-                    
-                    if st.form_submit_button("🗑️ Delete Client Data", type="secondary"):
-                        if confirm_delete_client:
-                            success, message = tracker.delete_client_cycle(delete_client, delete_cycle_client)
-                            if success:
-                                st.success(f"✅ {message}")
-                                st.rerun()
-                            else:
-                                st.error(f"❌ {message}")
-                        else:
-                            st.error("❌ Please confirm deletion")
+                    st.error("Please confirm deletion")
     
     with tab2:
         st.subheader("📊 Data Overview")
         
-        # Summary stats
         col1, col2, col3, col4 = st.columns(4)
-        
         with col1:
-            total_shipments = data_summary['shipment_count'].sum()
-            st.metric("📦 Total Shipments", f"{total_shipments:,}")
-        
+            st.metric("📦 Total Shipments", f"{data_summary['shipment_count'].sum():,}")
         with col2:
-            unique_clients = data_summary['client'].nunique()
-            st.metric("👥 Unique Clients", unique_clients)
-        
+            st.metric("👥 Unique Clients", data_summary['client'].nunique())
         with col3:
-            unique_carriers = data_summary['carrier'].nunique()
-            st.metric("🚚 Carriers", unique_carriers)
-        
+            st.metric("🚚 Carriers", data_summary['carrier'].nunique())
         with col4:
-            unique_cycles = data_summary['cycle_period'].nunique()
-            st.metric("📅 Billing Cycles", unique_cycles)
+            st.metric("📅 Billing Cycles", data_summary['cycle_period'].nunique())
         
-        # Data table with formatted values
-        st.subheader("📋 All Uploaded Data")
-        display_summary = data_summary.copy()
-        display_summary['cost'] = display_summary['cost'].apply(lambda x: f"${x:,.2f}")
-        display_summary['billable_amount'] = display_summary['billable_amount'].apply(lambda x: f"${x:,.2f}")
-        display_summary['profit'] = display_summary['profit'].apply(lambda x: f"${x:,.2f}")
-        
-        st.dataframe(display_summary, use_container_width=True, hide_index=True)
-        
-        # Upload history
-        st.markdown("---")
-        st.subheader("📝 Upload History")
-        upload_log = tracker.load_upload_log()
-        
-        if not upload_log.empty:
-            # Add status column if it doesn't exist (for older versions)
-            if 'status' not in upload_log.columns:
-                upload_log['status'] = 'Active'
-            
-            # Format display
-            display_log = upload_log.copy()
-            display_log['upload_date'] = pd.to_datetime(display_log['upload_date']).dt.strftime('%Y-%m-%d %H:%M')
-            
-            st.dataframe(
-                display_log[['filename', 'carrier', 'cycle_period', 'records_imported', 'upload_date', 'status']], 
-                use_container_width=True, 
-                hide_index=True
-            )
+        st.dataframe(data_summary, use_container_width=True, hide_index=True)
     
     with tab3:
         st.subheader("💾 Data Backup")
-        st.markdown("*Export complete backup of all billing data*")
         
         if st.button("📥 Generate Backup"):
             backup_data = tracker.export_data_backup()
             if backup_data:
                 filename = f"freight_billing_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                
                 st.download_button(
                     "📁 Download Complete Backup",
                     backup_data,
                     filename,
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-                st.success("✅ Backup generated successfully!")
-            else:
-                st.error("❌ Error generating backup")
-        
-        # File sizes
-        st.markdown("---")
-        st.subheader("💾 Storage Information")
-        
-        files_info = []
-        files = [
-            ("Shipment Data", tracker.shipment_data_file),
-            ("Billing Checklist", tracker.billing_checklist_file),
-            ("Upload Log", tracker.upload_log_file)
-        ]
-        
-        for name, path in files:
-            if path.exists():
-                size_mb = path.stat().st_size / (1024 * 1024)
-                files_info.append([name, f"{size_mb:.2f} MB", "✅ Exists"])
-            else:
-                files_info.append([name, "0 MB", "❌ Missing"])
-        
-        files_df = pd.DataFrame(files_info, columns=["File", "Size", "Status"])
-        st.dataframe(files_df, use_container_width=True, hide_index=True)
+                st.success("✅ Backup generated!")
     
     with tab4:
         st.subheader("⚠️ Reset All Data")
         st.error("🚨 **DANGER ZONE:** This will permanently delete ALL billing data")
         
-        st.markdown("""
-        **This action will:**
-        - Delete all shipment records
-        - Clear the billing checklist
-        - Remove upload history
-        - Reset all files to empty state
-        
-        **⚠️ This cannot be undone!**
-        """)
-        
         with st.form("reset_all_form"):
             st.markdown("**To confirm, type:** `DELETE_ALL_BILLING_DATA`")
             confirmation_code = st.text_input("Confirmation Code", type="password")
             
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                if st.form_submit_button("🗑️ RESET ALL", type="secondary"):
-                    if confirmation_code == "DELETE_ALL_BILLING_DATA":
-                        success, message = tracker.clear_all_data(confirmation_code)
-                        if success:
-                            st.success("✅ All data has been cleared")
-                            st.rerun()
-                        else:
-                            st.error(f"❌ {message}")
+            if st.form_submit_button("🗑️ RESET ALL"):
+                if confirmation_code == "DELETE_ALL_BILLING_DATA":
+                    success, message = tracker.clear_all_data(confirmation_code)
+                    if success:
+                        st.success("✅ All data has been cleared")
+                        st.rerun()
                     else:
-                        st.error("❌ Incorrect confirmation code")
-            
-            with col2:
-                st.info("💡 **Tip:** Generate a backup before resetting if you want to preserve data")
+                        st.error(f"❌ {message}")
+                else:
+                    st.error("❌ Incorrect confirmation code")
+
+
+def show_settings(tracker):
+    """Show settings page"""
+    st.header("⚙️ Settings")
+    
+    # Input Folder Configuration
+    st.subheader("📂 Input Folder Configuration")
+    
+    current_folder = tracker.get_input_folder()
+    
+    st.write(f"**Current Input Folder:** `{current_folder if current_folder else 'Not configured'}`")
+    
+    with st.form("folder_settings"):
+        new_folder = st.text_input(
+            "📁 Input Folder Path",
+            value=current_folder,
+            placeholder=r"e.g., C:\BillingFiles or \\server\share\billing",
+            help="Enter the full path to the folder containing carrier files"
+        )
+        
+        st.markdown("""
+        **Filename Convention:**
+        Files should be named as `CarrierName_CyclePeriod.xlsx` for automatic detection.
+        
+        Examples:
+        - `FedEx_2024-11.xlsx`
+        - `UPS_November2024.csv`
+        - `DHL_2024-11-Week1.xlsx`
+        """)
+        
+        if st.form_submit_button("💾 Save Settings"):
+            tracker.set_input_folder(new_folder)
+            st.success(f"✅ Input folder updated to: {new_folder}")
+    
+    # Clear processed files list
+    st.markdown("---")
+    st.subheader("🔄 Processed Files")
+    
+    processed_count = len(tracker.config.get('processed_files', []))
+    st.write(f"**Files marked as processed:** {processed_count}")
+    
+    if processed_count > 0:
+        with st.expander("View processed files"):
+            for f in tracker.config.get('processed_files', []):
+                st.write(f"- `{f}`")
+        
+        if st.button("🗑️ Clear Processed Files List"):
+            tracker.config['processed_files'] = []
+            tracker.save_config()
+            st.success("✅ Processed files list cleared. Files will show as 'new' on next scan.")
+            st.rerun()
+    
+    # Data Files Info
+    st.markdown("---")
+    st.subheader("📁 Data Files")
+    st.write(f"**Data Location:** `{tracker.data_folder}`")
+    
+    files = [
+        ("📦 Shipment Data", tracker.shipment_data_file),
+        ("📋 Billing Checklist", tracker.billing_checklist_file),
+        ("📝 Upload Log", tracker.upload_log_file),
+        ("⚙️ Config", tracker.config_file)
+    ]
+    
+    for name, path in files:
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            if path.exists():
+                st.success(f"✅ {name}")
+            else:
+                st.error(f"❌ {name}")
+        with col2:
+            st.code(str(path))
+    
+    # Column Detection Help
+    st.markdown("---")
+    st.subheader("❓ Column Detection Help")
+    
+    with st.expander("🔧 Supported Column Names"):
+        st.markdown("""
+        **The system automatically detects these column variations:**
+        
+        - **Client:** `client`, `customer`, `customer_name`, `account`, `consignee`, `shipper`, `company`
+        - **Cost:** `cost`, `freight_cost`, `shipping_cost`, `carrier_charge`, `total_cost`
+        - **Billable Amount:** `billable`, `billable_amount`, `revenue`, `charge_amount`, `bill_amount`
+        - **Tracking:** `tracking`, `tracking_number`, `tracking_id`, `awb`, `pro`
+        - **Service:** `service`, `service_type`, `service_level`
+        - **Weight:** `weight`, `package_weight`, `total_weight`
+        - **Zone:** `zone`, `delivery_zone`, `shipping_zone`
+        - **Dates:** `ship_date`, `pickup_date`, `delivery_date`
+        """)
+
 
 if __name__ == "__main__":
-    import time
     main()
